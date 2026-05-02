@@ -1,4 +1,6 @@
 ﻿#include "storage/table_page.h"
+#include "buffer/buffer_pool_manager.h"
+#include <optional>
 
 namespace db {
 

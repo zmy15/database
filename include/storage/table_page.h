@@ -2,6 +2,7 @@
 
 #include "buffer/page.h"
 #include "storage/tuple.h"
+#include "buffer/buffer_pool_manager.h"
 #include <optional>
 #include <cstring>
 
