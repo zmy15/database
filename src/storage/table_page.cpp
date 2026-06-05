@@ -48,7 +48,6 @@ bool TablePage::InsertTuple(const Tuple& tuple, RID* rid) {
 
 std::optional<Tuple> TablePage::GetTuple(const RID& rid) {
     uint32_t slot_num = rid.GetSlotNum();
-
     if (slot_num >= GetTupleCount()) {
         return std::nullopt; // 超出范围，找不到这条记录
     }
@@ -66,6 +65,34 @@ std::optional<Tuple> TablePage::GetTuple(const RID& rid) {
     tuple.SetRID(rid);
 
     return tuple;
+}
+
+bool TablePage::MarkDelete(uint32_t slot_num) {
+    if (slot_num >= GetTupleCount()) {
+        return false;
+    }
+    SetTupleSize(slot_num, 0);
+    return true;
+}
+
+bool TablePage::UpdateTuple(uint32_t slot_num, const Tuple& new_tuple) {
+    if (slot_num >= GetTupleCount()) {
+        return false;
+    }
+
+    uint32_t old_size = GetTupleSize(slot_num);
+    if (old_size == 0) {
+        return false;
+    }
+
+    uint32_t new_size = new_tuple.GetSize();
+    if (new_size != old_size) {
+        return false;
+    }
+
+    uint32_t tuple_offset = GetTupleOffset(slot_num);
+    new_tuple.SerializeTo(GetData() + tuple_offset);
+    return true;
 }
 
 } // namespace db

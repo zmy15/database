@@ -1,5 +1,6 @@
-﻿#include "storage/table_heap.h"
+#include "storage/table_heap.h"
 #include "storage/table_iterator.h"
+#include <cstring>
 
 namespace db {
 
@@ -19,6 +20,38 @@ void TableHeap::Init() {
     // 首尾相连，只有一页
     last_page_id_ = first_page_id_;
     bpm_->UnpinPage(first_page_id_, true);
+}
+
+void TableHeap::Load(page_id_t first_page_id) {
+    first_page_id_ = first_page_id;
+    last_page_id_ = first_page_id;
+    // 沿链表找到最后一页
+    page_id_t current = first_page_id;
+    while (current != INVALID_PAGE_ID) {
+        Page* page = bpm_->FetchPage(current);
+        if (!page) break;
+        auto* tp = reinterpret_cast<TablePage*>(page);
+        page_id_t next = tp->GetNextPageId();
+        bpm_->UnpinPage(current, false);
+        if (next == INVALID_PAGE_ID) break;
+        last_page_id_ = next;
+        current = next;
+    }
+}
+
+void TableHeap::Drop() {
+    page_id_t current = first_page_id_;
+    while (current != INVALID_PAGE_ID) {
+        Page* page = bpm_->FetchPage(current);
+        if (!page) break;
+        auto* tp = reinterpret_cast<TablePage*>(page);
+        page_id_t next = tp->GetNextPageId();
+        std::memset(page->GetData(), 0, PAGE_SIZE);
+        bpm_->UnpinPage(current, true);
+        current = next;
+    }
+    first_page_id_ = INVALID_PAGE_ID;
+    last_page_id_ = INVALID_PAGE_ID;
 }
 
 bool TableHeap::InsertTuple(const Tuple& tuple, RID* rid) {
@@ -74,6 +107,35 @@ std::optional<Tuple> TableHeap::GetTuple(const RID& rid) {
     bpm_->UnpinPage(rid.GetPageId(), false); // 只是读不修改，设为 false
 
     return result;
+}
+
+bool TableHeap::DeleteTuple(const RID& rid) {
+    Page* page = bpm_->FetchPage(rid.GetPageId());
+    if (!page) { return false; }
+
+    auto* table_page = reinterpret_cast<TablePage*>(page);
+    bool ok = table_page->MarkDelete(rid.GetSlotNum());
+
+    bpm_->UnpinPage(rid.GetPageId(), true);
+    return ok;
+}
+
+bool TableHeap::UpdateTuple(const RID& rid, const Tuple& new_tuple) {
+    Page* page = bpm_->FetchPage(rid.GetPageId());
+    if (!page) { return false; }
+
+    auto* table_page = reinterpret_cast<TablePage*>(page);
+
+    if (table_page->UpdateTuple(rid.GetSlotNum(), new_tuple)) {
+        bpm_->UnpinPage(rid.GetPageId(), true);
+        return true;
+    }
+
+    table_page->MarkDelete(rid.GetSlotNum());
+    bpm_->UnpinPage(rid.GetPageId(), true);
+
+    RID new_rid;
+    return InsertTuple(new_tuple, &new_rid);
 }
 
 TableIterator TableHeap::Begin() {

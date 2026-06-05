@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "common/config.h"
 #include "buffer/page.h"
@@ -26,7 +26,13 @@ public:
     // 创建新页
     virtual Page* NewPage(page_id_t* page_id);
     // 强制将脏页刷入磁盘 (刷盘前会调用 LogManager 确保 WAL 先落盘)
+
+    // 将所有脏页刷入磁盘（用于恢复完成后持久化）
+    void FlushAllPages();
     virtual bool FlushPage(page_id_t page_id);
+
+    // 从缓冲池中移除指定页并清零磁盘（用于 DROP TABLE）
+    virtual bool DeletePage(page_id_t page_id);
 
     void Destroy();
 

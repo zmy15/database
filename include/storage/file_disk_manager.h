@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "storage/disk_manager.h"
 #include <fstream>
@@ -25,6 +25,7 @@ public:
 
     // 分配一个新的页ID
     page_id_t AllocatePage() override;
+     void DeallocatePage(page_id_t page_id) override;
 
 private:
     int GetFileSize(const std::string& file_name);

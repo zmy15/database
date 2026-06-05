@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "storage/table_heap.h"
 #include <optional>
@@ -16,6 +16,9 @@ public:
 
     // 获取当前游标指向的记录
     std::optional<Tuple> Get();
+
+    // 获取当前游标的 RID
+    RID GetRID() const { return rid_; }
 
     // 迭代器步进运算符 (++it)
     TableIterator& operator++();

@@ -18,14 +18,35 @@ BufferPoolManager::BufferPoolManager(size_t pool_size, DiskManager* disk_manager
         free_list_.push_back(i);
     }
 }
+
 BufferPoolManager::~BufferPoolManager() {
     Destroy();
 }
+
+void BufferPoolManager::FlushAllPages() {
+    std::lock_guard<std::mutex> lock(latch_);
+    if (pages_ == nullptr) return;
+
+    for (size_t i = 0; i < pool_size_; ++i) {
+        if (pages_[i].is_dirty_ && pages_[i].page_id_ != INVALID_PAGE_ID) {
+            if (log_manager_ && pages_[i].GetLSN() > log_manager_->GetFlushedLSN()) {
+                log_manager_->FlushLogs();
+            }
+            disk_manager_->WritePage(pages_[i].page_id_, pages_[i].data_);
+            pages_[i].is_dirty_ = false;
+        }
+    }
+}
+
 void BufferPoolManager::Destroy() {
     // 销毁前把所有脏页都先刷盘
     if (pages_ != nullptr) {
         for (size_t i = 0; i < pool_size_; ++i) {
             if (pages_[i].is_dirty_ && pages_[i].page_id_ != -1) {
+                // WAL 先刷盘，确保日志在数据页之前落盘
+                if (log_manager_ && pages_[i].GetLSN() > log_manager_->GetFlushedLSN()) {
+                    log_manager_->FlushLogs();
+                }
                 disk_manager_->WritePage(pages_[i].page_id_, pages_[i].data_);
             }
         }
@@ -44,8 +65,10 @@ bool BufferPoolManager::FlushPage(page_id_t page_id) {
     int frame_id = it->second;
     Page* page = &pages_[frame_id];
 
-    // 如果启用了 WAL（日志管理），这里必须在刷入数据前确保日志也落盘
-    // if (log_manager_ && page->GetLSN() > log_manager_->GetFlushedLSN()) { log_manager_->Flush(); }
+    // WAL 先刷盘：数据页落盘前，确保该页相关的 WAL 日志已持久化
+    if (log_manager_ && page->GetLSN() > log_manager_->GetFlushedLSN()) {
+        log_manager_->FlushLogs();
+    }
 
     disk_manager_->WritePage(page->page_id_, page->data_);
     page->is_dirty_ = false;
@@ -61,42 +84,40 @@ Page* BufferPoolManager::FetchPage(page_id_t page_id) {
         int frame_id = it->second;
         Page* page = &pages_[frame_id];
         page->pin_count_++;
-        replacer_->Pin(frame_id); // 既然借出去了，就不能被淘汰
+        replacer_->Pin(frame_id);
         return page;
     }
 
     // 2. 如果不在内存中，我们需要找一个空的内存槽(frame)
     int frame_id = -1;
     if (!free_list_.empty()) {
-        // 还有没被填过的全新槽位，直接用
         frame_id = free_list_.front();
         free_list_.pop_front();
     } else {
-        // 所有的槽位都用过了，请求 LRU 强制征用（淘汰）一个不活跃的也没被锁定的槽
         if (!replacer_->Victim(&frame_id)) {
-            // Buffer pool 全部塞满了而且由于都在借用状态没有一个能替出去的...
-            return nullptr; 
+            return nullptr;
         }
 
-        // 拿下淘汰的槽位，如果是脏页则要先写入磁盘！
         Page* old_page = &pages_[frame_id];
         if (old_page->is_dirty_) {
+            if (log_manager_ && old_page->GetLSN() > log_manager_->GetFlushedLSN()) {
+                log_manager_->FlushLogs();
+            }
             disk_manager_->WritePage(old_page->page_id_, old_page->data_);
         }
-        // 从页表中删除旧记录
         page_table_.erase(old_page->page_id_);
     }
 
     // 3. 开始将新页载入这个腾出来的 frame
     Page* page = &pages_[frame_id];
     page->page_id_ = page_id;
-    page->pin_count_ = 1;      // 被当前线程使用
-    page->is_dirty_ = false;   // 刚读出来的全新状态
-    disk_manager_->ReadPage(page_id, page->data_); // 从磁盘加载数据
+    page->pin_count_ = 1;
+    page->is_dirty_ = false;
+    disk_manager_->ReadPage(page_id, page->data_);
 
     // 4. 更新页表与替换器记录
     page_table_[page_id] = frame_id;
-    replacer_->Pin(frame_id); // 因为马上要在外面使用，不能被淘汰
+    replacer_->Pin(frame_id);
 
     return page;
 }
@@ -116,16 +137,47 @@ bool BufferPoolManager::UnpinPage(page_id_t page_id, bool is_dirty) {
         return false;
     }
 
-    // 合并修改状态（如果是脏页绝对不能丢失）
     if (is_dirty) {
         page->is_dirty_ = true;
     }
 
     page->pin_count_--;
-    // 如果没有人在用了，就可以交给 LRU 候补排队了
     if (page->pin_count_ == 0) {
-        replacer_->Unpin(frame_id); 
+        replacer_->Unpin(frame_id);
     }
+
+    return true;
+}
+
+bool BufferPoolManager::DeletePage(page_id_t page_id) {
+    std::lock_guard<std::mutex> lock(latch_);
+
+    auto it = page_table_.find(page_id);
+    if (it == page_table_.end()) {
+        // 页不在缓冲池中，直接从磁盘清零
+        char empty_data[PAGE_SIZE] = {0};
+        disk_manager_->WritePage(page_id, empty_data);
+        return true;
+    }
+
+    int frame_id = it->second;
+    Page* page = &pages_[frame_id];
+
+    // 清零页面数据
+    std::memset(page->data_, 0, PAGE_SIZE);
+    page->is_dirty_ = true;
+
+    // 从页表中移除
+    page_table_.erase(it);
+
+    // 将 frame 放回空闲列表
+    replacer_->Pin(frame_id); // 先从 LRU 中移除
+    page->page_id_ = INVALID_PAGE_ID;
+    page->pin_count_ = 0;
+    free_list_.push_back(frame_id);
+
+    // 同时清空磁盘上的页面
+    disk_manager_->DeallocatePage(page_id);
 
     return true;
 }
@@ -135,32 +187,31 @@ Page* BufferPoolManager::NewPage(page_id_t* page_id) {
 
     int frame_id = -1;
 
-    // 获取可用的空闲槽（要么是本来就没用的，要么淘汰一个出来）
     if (!free_list_.empty()) {
         frame_id = free_list_.front();
         free_list_.pop_front();
     } else {
         if (!replacer_->Victim(&frame_id)) {
-            return nullptr; 
+            return nullptr;
         }
         Page* old_page = &pages_[frame_id];
         if (old_page->is_dirty_) {
+            if (log_manager_ && old_page->GetLSN() > log_manager_->GetFlushedLSN()) {
+                log_manager_->FlushLogs();
+            }
             disk_manager_->WritePage(old_page->page_id_, old_page->data_);
         }
         page_table_.erase(old_page->page_id_);
     }
 
-    // 呼叫 DiskManager 分配一个全新的页 ID
     *page_id = disk_manager_->AllocatePage();
 
-    // 初始化该槽位
     Page* page = &pages_[frame_id];
     page->page_id_ = *page_id;
     page->pin_count_ = 1;
-    page->is_dirty_ = true; // 刚创建就被认为是脏的，需要写盘一次
-    std::memset(page->data_, 0, PAGE_SIZE); // 清空遗留的内存数据
+    page->is_dirty_ = true;
+    std::memset(page->data_, 0, PAGE_SIZE);
 
-    // 记录
     page_table_[*page_id] = frame_id;
     replacer_->Pin(frame_id);
 

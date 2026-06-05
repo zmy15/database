@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "buffer/page.h"
 #include "storage/tuple.h"
@@ -31,6 +31,10 @@ namespace db {
 class TablePage : public Page {
 public:
     void Init(page_id_t page_id, page_id_t prev_page_id, BufferPoolManager* bpm);
+    // 删改
+    bool MarkDelete(uint32_t slot_num);
+    bool UpdateTuple(uint32_t slot_num, const Tuple& new_tuple);
+
 
     page_id_t GetTablePageId() { return *reinterpret_cast<page_id_t*>(GetData()); }
     page_id_t GetPrevPageId() { return *reinterpret_cast<page_id_t*>(GetData() + 8); }

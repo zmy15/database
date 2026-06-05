@@ -11,6 +11,7 @@ public:
     virtual void ReadPage(page_id_t page_id, char* page_data) = 0;
     virtual void WritePage(page_id_t page_id, const char* page_data) = 0;
     virtual page_id_t AllocatePage() = 0; // 分配新页
+    virtual void DeallocatePage(page_id_t page_id) = 0; // 回收页
 };
 
 } // namespace db

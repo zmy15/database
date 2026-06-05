@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "common/config.h"
 #include "buffer/buffer_pool_manager.h"
@@ -6,26 +6,60 @@
 #include <string>
 #include <optional>
 #include <shared_mutex>
+#include <vector>
 
 namespace db {
 
-// B+ 树索引结构，依赖 BufferPoolManager 读取和修改节点（Page）
-class BPlusTree {
-public:
-    BPlusTree(std::string index_name, BufferPoolManager* bpm) : name_(std::move(index_name)), bpm_(bpm) {}
+class BPlusTreePage;
 
-    // 插入键值对
+/**
+ * @brief B+ 树索引结构
+ *
+ * 内部节点约定：
+ *   - prev_page_id 存储 child[0]（第一个子节点，覆盖 < key[0] 的范围）
+ *   - slot[i] 存储 (key[i], child[i+1])，child[i+1] 覆盖 >= key[i] 的范围
+ *   - N 个 key 对应 N+1 个子节点
+ */
+class BPlusTree {
+    /** 删除指定键（标记删除，不回收空间） */
+
+public:
+    BPlusTree(std::string index_name, BufferPoolManager* bpm)
+        : name_(std::move(index_name)), bpm_(bpm) {}
+
+    /** 插入键值对 */
     bool Insert(const std::string& key, const Tuple& value, txn_id_t txn_id);
-    // 点查
+
+    /** 点查 */
     std::optional<Tuple> GetValue(const std::string& key, txn_id_t txn_id);
-    // 范围查询（返回迭代器）
-    // IndexIterator Begin(const std::string& start_key);
+
+    /** 删除指定键（标记删除，不回收空间） */
+    bool Remove(const std::string& key);
+
+    /** 范围扫描：返回 [start_key, end_key] 范围内的所有 Tuple */
+    std::vector<Tuple> ScanRange(const std::string& start_key,
+                                  const std::string& end_key,
+                                  txn_id_t txn_id);
+
+    /** 获取根页 ID（供测试用） */
+    page_id_t GetRootPageId() const { return root_page_id_; }
+
+    /** 删除整棵 B+ 树：遍历所有页面，回收空间 */
+    void Drop();
 
 private:
+    bool InsertIntoEmptyTree(const std::string& key, const Tuple& value);
+    bool InsertIntoLeaf(const std::string& key, const Tuple& value);
+    bool InsertIntoParent(page_id_t old_page_id, const std::string& split_key, page_id_t new_page_id);
+    void UpdateParentPointers(page_id_t page_id, BPlusTreePage* node);
+
+    // 从指定页开始递归收集所有后代页 ID（用于清理）
+    void CollectAllPageIds(page_id_t page_id, std::vector<page_id_t>& ids);
+
     std::string name_;
-    page_id_t root_page_id_ = -1;
+    page_id_t root_page_id_ = INVALID_PAGE_ID;
     BufferPoolManager* bpm_;
-    std::shared_mutex root_latch_; // 保护根节点变化的锁（如Crabbing协议）
+    std::shared_mutex root_latch_;
 };
 
 } // namespace db

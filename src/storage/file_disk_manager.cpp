@@ -79,6 +79,12 @@ page_id_t FileDiskManager::AllocatePage() {
     return new_page_id;
 }
 
+void FileDiskManager::DeallocatePage(page_id_t page_id) {
+    // 简化实现：将页面数据清零（标记为可回收）
+    char empty_data[PAGE_SIZE] = {0};
+    WritePage(page_id, empty_data);
+}
+
 int FileDiskManager::GetFileSize(const std::string& file_name) {
     if (!std::filesystem::exists(file_name)) return 0;
     return std::filesystem::file_size(file_name);
