@@ -4,6 +4,7 @@
 #include "buffer/buffer_pool_manager.h"
 #include "storage/tuple.h"
 #include <string>
+#include <stack>
 #include <optional>
 #include <shared_mutex>
 #include <vector>
@@ -49,7 +50,9 @@ public:
 
 private:
     bool InsertIntoEmptyTree(const std::string& key, const Tuple& value);
-    bool InsertIntoLeaf(const std::string& key, const Tuple& value);
+     bool InsertIntoLeaf(page_id_t leaf_id, BPlusTreePage* leaf_node,
+                         const std::string& key, const Tuple& value,
+                         std::stack<std::pair<page_id_t, BPlusTreePage*>>& path);
     bool InsertIntoParent(page_id_t old_page_id, const std::string& split_key, page_id_t new_page_id);
     void UpdateParentPointers(page_id_t page_id, BPlusTreePage* node);
 

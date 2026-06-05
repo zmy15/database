@@ -157,66 +157,8 @@ bool BPlusTree::Insert(const std::string& key, const Tuple& value, txn_id_t txn_
         auto* node = reinterpret_cast<BPlusTreePage*>(page);
 
         if (node->IsLeaf()) {
-            // 到达叶子，尝试插入
-            int pos = node->FindInsertPos(key);
-            bool inserted = node->InsertSlot(pos, key, value);
-
-            if (inserted) {
-                // 插入成功，沿路径释放所有页面
-                bpm_->UnpinPage(page_id, true);
-                while (!path.empty()) {
-                    auto& [pid, pnode] = path.top();
-                    bpm_->UnpinPage(pid, false);
-                    path.pop();
-                }
-                root_latch_.unlock();
-                return true;
-            }
-
-            // 叶子已满，需要分裂
-            // 创建新页面
-            page_id_t new_page_id;
-            Page* new_page = bpm_->NewPage(&new_page_id);
-            if (!new_page) {
-                bpm_->UnpinPage(page_id, false);
-                while (!path.empty()) {
-                    auto& [pid, pnode] = path.top();
-                    bpm_->UnpinPage(pid, false);
-                    path.pop();
-                }
-                root_latch_.unlock();
-                return false;
-            }
-            auto* new_node = reinterpret_cast<BPlusTreePage*>(new_page);
-            new_node->Init(new_page_id, true);
-
-            // 先分裂：将一半数据移到新节点（避免 force 插入破坏槽位区）
-            uint32_t old_count = node->GetSlotCount();
-            node->MoveHalfTo(new_node);
-
-            // 确定新数据应插入哪个页面
-            uint32_t new_mid = node->GetSlotCount(); // 分裂后原页面的 slot 数
-            // 注意：pos == new_mid 表示应插入到新页面的第一个位置（slot[mid] 已被移走）
-            if (static_cast<uint32_t>(pos) < new_mid) {
-                // 插入位置在原页面
-                node->InsertSlot(pos, key, value);
-            } else {
-                // 插入位置在新页面
-                uint32_t new_pos = static_cast<uint32_t>(pos) - new_mid;
-                new_node->InsertSlot(new_pos, key, value);
-            }
-
-            // 获取分裂键（新页面的第一个 key）
-            std::string split_key = new_node->GetKey(0);
-
-            // 释放当前叶子和新叶子
-            bpm_->UnpinPage(new_page_id, true);
-            bpm_->UnpinPage(page_id, true);
-
-            // 向上插入父节点
-            root_latch_.unlock();
-            InsertIntoParent(page_id, split_key, new_page_id);
-            return true;
+            // 到达叶子，委托给 InsertIntoLeaf 处理插入与分裂
+            return InsertIntoLeaf(page_id, node, key, value, path);
         }
 
         // 内部节点：继续向下
@@ -241,6 +183,80 @@ bool BPlusTree::InsertIntoEmptyTree(const std::string& key, const Tuple& value) 
 
     root_page_id_ = new_page_id;
     bpm_->UnpinPage(new_page_id, true);
+    return true;
+}
+
+// ============================================================
+// InsertIntoLeaf — 在叶子节点中插入，处理满叶分裂
+// ============================================================
+
+bool BPlusTree::InsertIntoLeaf(page_id_t leaf_id, BPlusTreePage* leaf_node,
+                                const std::string& key, const Tuple& value,
+                                std::stack<std::pair<page_id_t, BPlusTreePage*>>& path) {
+    int pos = leaf_node->FindInsertPos(key);
+    bool inserted = leaf_node->InsertSlot(pos, key, value);
+
+    if (inserted) {
+        // 插入成功，沿路径释放所有页面
+        bpm_->UnpinPage(leaf_id, true);
+        while (!path.empty()) {
+            auto& [pid, pnode] = path.top();
+            bpm_->UnpinPage(pid, false);
+            path.pop();
+        }
+        root_latch_.unlock();
+        return true;
+    }
+
+    // 叶子已满，需要分裂
+    // 创建新页面
+    page_id_t new_page_id;
+    Page* new_page = bpm_->NewPage(&new_page_id);
+    if (!new_page) {
+        bpm_->UnpinPage(leaf_id, false);
+        while (!path.empty()) {
+            auto& [pid, pnode] = path.top();
+            bpm_->UnpinPage(pid, false);
+            path.pop();
+        }
+        root_latch_.unlock();
+        return false;
+    }
+    auto* new_node = reinterpret_cast<BPlusTreePage*>(new_page);
+    new_node->Init(new_page_id, true);
+
+    // 先分裂：将一半数据移到新节点（避免 force 插入破坏槽位区）
+    leaf_node->MoveHalfTo(new_node);
+
+    // 确定新数据应插入哪个页面
+    uint32_t new_mid = leaf_node->GetSlotCount(); // 分裂后原页面的 slot 数
+    // 注意：pos == new_mid 表示应插入到新页面的第一个位置（slot[mid] 已被移走）
+    if (static_cast<uint32_t>(pos) < new_mid) {
+        // 插入位置在原页面
+        leaf_node->InsertSlot(pos, key, value);
+    } else {
+        // 插入位置在新页面
+        uint32_t new_pos = static_cast<uint32_t>(pos) - new_mid;
+        new_node->InsertSlot(new_pos, key, value);
+    }
+
+    // 获取分裂键（新页面的第一个 key）
+    std::string split_key = new_node->GetKey(0);
+
+    // 释放当前叶子和新叶子
+    bpm_->UnpinPage(new_page_id, true);
+    bpm_->UnpinPage(leaf_id, true);
+
+    // 释放路径中的内部节点页面（InsertIntoParent 会自行加锁和遍历）
+    while (!path.empty()) {
+        auto& [pid, pnode] = path.top();
+        bpm_->UnpinPage(pid, false);
+        path.pop();
+    }
+    root_latch_.unlock();
+
+    // 向上插入父节点
+    InsertIntoParent(leaf_id, split_key, new_page_id);
     return true;
 }
 
@@ -502,14 +518,30 @@ void BPlusTree::CollectAllPageIds(page_id_t page_id, std::vector<page_id_t>& ids
     ids.push_back(page_id);
 
     if (!node->IsLeaf()) {
-        // 内部节点：收集 child[0]（prev_page_id）和所有 slot 中的子节点
+        // 先在 Unpin 之前收集所有子节点 ID（避免页面被淘汰后无法读取 slot）
+        std::vector<page_id_t> children;
+
+        // child[0]（prev_page_id），覆盖 < key[0] 的范围
         page_id_t child0 = node->GetPrevPageId();
+        if (child0 != INVALID_PAGE_ID) {
+            children.push_back(child0);
+        }
+
+        // slot[i] 中的 child[i+1]，覆盖 >= key[i] 的范围
+        uint32_t slot_count = node->GetSlotCount();
+        for (uint32_t i = 0; i < slot_count; ++i) {
+            page_id_t child = node->GetChildId(i);
+            if (child != INVALID_PAGE_ID) {
+                children.push_back(child);
+            }
+        }
+
         bpm_->UnpinPage(page_id, false);
-        CollectAllPageIds(child0, ids);
-        // 重新 fetch 以读取 slot（因为 Unpin 后页面可能被淘汰）
-        // 实际上在同一个调用栈帧中 page 不会被淘汰（pin_count > 0）
-        // 上面的 Unpin 会减少 pin_count，但 CollectAllPageIds 在 Unpin 后调用，
-        // 所以这里需要重新获取。更安全的做法是先收集所有子节点 ID 再递归。
+
+        // 安全地递归收集所有子节点
+        for (page_id_t child : children) {
+            CollectAllPageIds(child, ids);
+        }
     } else {
         bpm_->UnpinPage(page_id, false);
     }

@@ -1,4 +1,4 @@
-#include "concurrency/lock_manager.h"
+﻿#include "concurrency/lock_manager.h"
 #include "common/rid.h"
 #include <cassert>
 
@@ -9,7 +9,7 @@ namespace db {
 // ============================================================
 
 bool TwoPLManager::LockShared(Transaction* txn, const std::string& record_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     auto& entry = lock_table_[record_id];
 
@@ -33,7 +33,7 @@ bool TwoPLManager::LockShared(Transaction* txn, const std::string& record_id) {
 }
 
 bool TwoPLManager::LockExclusive(Transaction* txn, const std::string& record_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     auto& entry = lock_table_[record_id];
 
@@ -65,7 +65,7 @@ bool TwoPLManager::LockExclusive(Transaction* txn, const std::string& record_id)
 }
 
 bool TwoPLManager::Unlock(Transaction* txn, const std::string& record_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
 
     auto it = lock_table_.find(record_id);
     if (it == lock_table_.end()) {
@@ -99,7 +99,7 @@ bool TwoPLManager::Unlock(Transaction* txn, const std::string& record_id) {
 }
 
 bool TwoPLManager::UnlockAll(Transaction* txn) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     txn_id_t tid = txn->GetTransactionId();
 
     // 遍历锁表，释放该事务持有的所有锁

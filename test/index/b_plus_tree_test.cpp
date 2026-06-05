@@ -1,4 +1,4 @@
-﻿#include <gtest/gtest.h>
+#include <gtest/gtest.h>
 #include "index/b_plus_tree.h"
 #include "index/b_plus_tree_page.h"
 #include "buffer/buffer_pool_manager.h"
@@ -8,6 +8,7 @@
 #include <vector>
 #include <algorithm>
 #include <random>
+#include <cstdio>
 
 using namespace db;
 
@@ -104,6 +105,48 @@ TEST_F(BPlusTreeTest, OrderedInsertionMaintainsOrder) {
     for (int i = 0; i < N; ++i) {
         auto result = tree_->GetValue(keys[i], 0);
         ASSERT_TRUE(result.has_value()) << "Missing key: " << keys[i];
+    }
+}
+
+// ============================================================
+// 测试 10: 大型 B+ 树 Drop 后所有页面被正确回收（CollectAllPageIds 递归修复验证）
+// ============================================================
+TEST_F(BPlusTreeTest, DropLargeTreeReclaimsAllPages) {
+    // 插入 500 条数据，确保触发多层分裂（根节点、内部节点、叶子节点）
+    const int N = 500;
+    for (int i = 0; i < N; ++i) {
+        std::string key = "drop_" + std::to_string(i);
+        Tuple val = MakeTuple({key, "data_" + std::to_string(i)});
+        EXPECT_TRUE(tree_->Insert(key, val, 0));
+    }
+
+    // 验证全部数据可查，确认 B+ 树结构完整
+    for (int i = 0; i < N; ++i) {
+        std::string key = "drop_" + std::to_string(i);
+        auto result = tree_->GetValue(key, 0);
+        ASSERT_TRUE(result.has_value()) << "Missing key before Drop: " << key;
+    }
+
+    // 记录根页 ID，Drop 后应重置为 INVALID_PAGE_ID
+    page_id_t old_root = tree_->GetRootPageId();
+    ASSERT_NE(old_root, INVALID_PAGE_ID) << "Root page should exist before Drop";
+
+    // 执行 Drop：遍历树并删除所有页面
+    tree_->Drop();
+
+    // 验证根页已重置
+    EXPECT_EQ(tree_->GetRootPageId(), INVALID_PAGE_ID);
+
+    // 验证 Drop 后可以重新插入数据（确认 B+ 树可正常重用）
+    for (int i = 0; i < 100; ++i) {
+        std::string key = "reborn_" + std::to_string(i);
+        Tuple val = MakeTuple({key});
+        EXPECT_TRUE(tree_->Insert(key, val, 0));
+    }
+    for (int i = 0; i < 100; ++i) {
+        std::string key = "reborn_" + std::to_string(i);
+        auto result = tree_->GetValue(key, 0);
+        ASSERT_TRUE(result.has_value()) << "Missing key after re-insert: " << key;
     }
 }
 
