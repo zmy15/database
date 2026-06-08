@@ -1,4 +1,4 @@
-﻿#include "index/b_plus_tree.h"
+#include "index/b_plus_tree.h"
 #include "index/b_plus_tree_page.h"
 #include <iostream>
 #include <stack>
@@ -44,14 +44,14 @@ std::optional<Tuple> BPlusTree::GetValue(const std::string& key, txn_id_t txn_id
         return std::nullopt;
     }
 
-    root_latch_.lock_shared();
+    root_latch_.lock();
     page_id_t page_id = root_page_id_;
 
     // 从根向下遍历到叶子
     while (true) {
         Page* page = bpm_->FetchPage(page_id);
         if (!page) {
-            root_latch_.unlock_shared();
+            root_latch_.unlock();
             return std::nullopt;
         }
         auto* node = reinterpret_cast<BPlusTreePage*>(page);
@@ -482,7 +482,7 @@ std::vector<Tuple> BPlusTree::ScanRange(const std::string& start_key,
                     if (key > end_key) {
                         bpm_->UnpinPage(leaf_id, false);
                         bpm_->UnpinPage(page_id, false);
-                        root_latch_.unlock_shared();
+                        root_latch_.unlock();
                         return results;
                     }
                 }

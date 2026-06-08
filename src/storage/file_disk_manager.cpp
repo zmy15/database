@@ -1,13 +1,19 @@
-﻿#include "storage/file_disk_manager.h"
+#include "storage/file_disk_manager.h"
 #include <iostream>
 #include <cstring>
-#include <filesystem>
 
 namespace db {
 
 FileDiskManager::FileDiskManager(const std::string& db_file) : file_name_(db_file) {
     // 尝试以多模式打开文件 (如果没有该文件，则利用 app 模式创建，否则原样打开)
     db_io_.open(db_file, std::ios::binary | std::ios::in | std::ios::out | std::ios::app);
+    // 回退：文件不存在则以写入模式创建（与 FileLogManager 一致）
+    if (!db_io_.is_open()) {
+        db_io_.clear();
+        db_io_.open(db_file, std::ios::binary | std::ios::out);
+        db_io_.close();
+        db_io_.open(db_file, std::ios::binary | std::ios::in | std::ios::out | std::ios::app);
+    }
     db_io_.close();
 
     // 重新用读写方式打开
@@ -86,8 +92,11 @@ void FileDiskManager::DeallocatePage(page_id_t page_id) {
 }
 
 int FileDiskManager::GetFileSize(const std::string& file_name) {
-    if (!std::filesystem::exists(file_name)) return 0;
-    return std::filesystem::file_size(file_name);
+    // 用纯 fstream 获取文件大小，避免 std::filesystem 在 Windows 上抛 system_error
+    std::ifstream in(file_name, std::ios::binary | std::ios::ate);
+    if (!in.is_open()) return 0;
+    auto size = in.tellg();
+    return static_cast<int>(size);
 }
 
 } // namespace db

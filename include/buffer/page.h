@@ -1,12 +1,12 @@
-﻿#pragma once
+#pragma once
 
 #include "common/config.h"
 #include <shared_mutex>
 
 namespace db {
 
-// 内存中的数据页
 class Page {
+    friend class BufferPoolManager;
 public:
     void RLock() { rwlatch_.lock_shared(); }
     void RUnlock() { rwlatch_.unlock_shared(); }
@@ -19,7 +19,6 @@ public:
     inline void SetLSN(lsn_t lsn) { lsn_ = lsn; }
 
 private:
-    friend class BufferPoolManager;
     char data_[PAGE_SIZE]{};     // 页内实际数据
     page_id_t page_id_ = -1;     // 对应的磁盘页ID
     int pin_count_ = 0;          // 被引用的次数（大于0说明有线程在用，不能被淘汰）

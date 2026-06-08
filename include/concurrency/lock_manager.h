@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "common/config.h"
 #include "concurrency/transaction.h"
@@ -24,6 +24,7 @@ public:
     virtual bool LockExclusive(Transaction* txn, const std::string& record_id) = 0;
     virtual bool Unlock(Transaction* txn, const std::string& record_id) = 0;
     virtual bool UnlockAll(Transaction* txn) = 0;
+    virtual void SetTransactionManager(TransactionManager* mgr) = 0;
 };
 
 // TwoPLManager — 两阶段锁协议的具体实现
@@ -32,7 +33,7 @@ public:
     TwoPLManager() = default;
 
     // 设置事务管理器（用于死锁检测时回调 Abort）
-    void SetTransactionManager(TransactionManager* mgr) { txn_manager_ = mgr; }
+    void SetTransactionManager(TransactionManager* mgr) override { txn_manager_ = mgr; }
 
     bool LockShared(Transaction* txn, const std::string& record_id) override;
     bool LockExclusive(Transaction* txn, const std::string& record_id) override;

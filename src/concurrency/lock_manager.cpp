@@ -1,6 +1,7 @@
 ﻿#include "concurrency/lock_manager.h"
-#include "common/rid.h"
 #include <cassert>
+#include <queue>
+#include <algorithm>
 
 namespace db {
 
@@ -9,59 +10,11 @@ namespace db {
 // ============================================================
 
 bool TwoPLManager::LockShared(Transaction* txn, const std::string& record_id) {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    auto& entry = lock_table_[record_id];
-
-    // 如果当前没有独占锁，或者独占锁就是当前事务自己持有的，允许加共享锁
-    if (entry.exclusive_holder == txn->GetTransactionId()) {
-        // 当前事务已持有独占锁，可以降级或共存（这里允许再加共享锁）
-        entry.shared_holders.insert(txn->GetTransactionId());
-        txn->AddSharedLock(RID(0, 0)); // 简化：用 dummy RID 记录
-        return true;
-    }
-
-    if (entry.exclusive_holder != -1 && entry.exclusive_holder != txn->GetTransactionId()) {
-        // 其他事务持有独占锁，拒绝
-        return false;
-    }
-
-    // 没有独占锁，可以加共享锁
-    entry.shared_holders.insert(txn->GetTransactionId());
-    txn->AddSharedLock(RID(0, 0));
-    return true;
+        return LockSharedInternal(txn, record_id, 0);
 }
 
 bool TwoPLManager::LockExclusive(Transaction* txn, const std::string& record_id) {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-
-    auto& entry = lock_table_[record_id];
-
-    // 如果当前事务已经持有独占锁
-    if (entry.exclusive_holder == txn->GetTransactionId()) {
-        return true;
-    }
-
-    // 如果有其他共享锁持有者（且不是当前事务自己），或者有其他独占锁持有者
-    bool has_other_shared = false;
-    for (auto holder : entry.shared_holders) {
-        if (holder != txn->GetTransactionId()) {
-            has_other_shared = true;
-            break;
-        }
-    }
-
-    if (has_other_shared || (entry.exclusive_holder != -1 && entry.exclusive_holder != txn->GetTransactionId())) {
-        return false;
-    }
-
-    // 可以加独占锁
-    // 如果当前事务之前持有共享锁，先清除
-    entry.shared_holders.erase(txn->GetTransactionId());
-    entry.exclusive_holder = txn->GetTransactionId();
-    entry.is_exclusive = true;
-    txn->AddExclusiveLock(RID(0, 0));
-    return true;
+        return LockExclusiveInternal(txn, record_id, 0);
 }
 
 bool TwoPLManager::Unlock(Transaction* txn, const std::string& record_id) {
@@ -78,7 +31,7 @@ bool TwoPLManager::Unlock(Transaction* txn, const std::string& record_id) {
     if (entry.exclusive_holder == tid) {
         entry.exclusive_holder = -1;
         entry.is_exclusive = false;
-        txn->RemoveLock(RID(0, 0));
+        txn->RemoveLock(record_id);
         // 如果锁表项已空，清理
         if (entry.shared_holders.empty() && entry.exclusive_holder == -1) {
             lock_table_.erase(it);
@@ -88,15 +41,231 @@ bool TwoPLManager::Unlock(Transaction* txn, const std::string& record_id) {
 
     if (entry.shared_holders.count(tid) > 0) {
         entry.shared_holders.erase(tid);
-        txn->RemoveLock(RID(0, 0));
+        txn->RemoveLock(record_id);
         if (entry.shared_holders.empty() && entry.exclusive_holder == -1) {
             lock_table_.erase(it);
         }
         return true;
     }
-
     return false;
 }
+
+    // ============================================================
+    // 死锁检测辅助方法
+    // ============================================================
+    
+    void TwoPLManager::RemoveWaitsFor(txn_id_t tid) {
+        // 移除出边：该事务不再等待任何人
+        waits_for_.erase(tid);
+    
+        // 移除入边：其他事务的等待集合中移除该事务
+        for (auto& pair : waits_for_) {
+            pair.second.erase(tid);
+        }
+    }
+    
+    std::vector<txn_id_t> TwoPLManager::CollectReachableNodes(txn_id_t start) {
+        std::vector<txn_id_t> result;
+        std::unordered_set<txn_id_t> visited;
+        std::queue<txn_id_t> q;
+    
+        // 从 start 的邻居开始 BFS（不自包含 start，通过检测能否回到 start 判断环）
+        auto it = waits_for_.find(start);
+        if (it == waits_for_.end()) {
+            return result;
+        }
+    
+        for (txn_id_t neighbor : it->second) {
+            if (visited.find(neighbor) == visited.end()) {
+                visited.insert(neighbor);
+                q.push(neighbor);
+                result.push_back(neighbor);
+            }
+        }
+    
+        while (!q.empty()) {
+            txn_id_t current = q.front();
+            q.pop();
+    
+            auto nit = waits_for_.find(current);
+            if (nit != waits_for_.end()) {
+                for (txn_id_t neighbor : nit->second) {
+                    if (visited.find(neighbor) == visited.end()) {
+                        visited.insert(neighbor);
+                        q.push(neighbor);
+                        result.push_back(neighbor);
+                    }
+                }
+            }
+        }
+    
+        return result;
+    }
+    
+    txn_id_t TwoPLManager::SelectVictim(const std::vector<txn_id_t>& nodes) {
+        txn_id_t victim = -1;
+        for (txn_id_t id : nodes) {
+            // 确认事务仍然存活
+            if (txn_manager_ && txn_manager_->GetTransaction(id) != nullptr) {
+                // 选择最年轻的事务（txn_id 最大）作为受害者
+                if (id > victim) {
+                    victim = id;
+                }
+            }
+        }
+        return victim;
+    }
+    
+    bool TwoPLManager::DetectCycle(txn_id_t start) {
+        // 检查自环（A 直接等待 A）
+        auto it = waits_for_.find(start);
+        bool has_self_loop = (it != waits_for_.end() && it->second.count(start) > 0);
+    
+        // 收集从 start 出发可达的所有节点
+        auto reachable = CollectReachableNodes(start);
+    
+        // 检查是否存在环（start 能通过其他节点回到自己）
+        bool has_cycle = has_self_loop;
+        if (!has_cycle) {
+            for (txn_id_t node : reachable) {
+                if (node == start) {
+                    has_cycle = true;
+                    break;
+                }
+            }
+        }
+    
+        if (has_cycle) {
+            // 构建候选受害者列表
+            std::vector<txn_id_t> candidates = reachable;
+            candidates.push_back(start);
+    
+            txn_id_t victim = SelectVictim(candidates);
+            if (victim != -1 && txn_manager_) {
+                Transaction* victim_txn = txn_manager_->GetTransaction(victim);
+                if (victim_txn) {
+                    txn_manager_->Abort(victim_txn);
+                }
+            }
+            // 清理等待图中的受害者边
+            RemoveWaitsFor(victim);
+            return true;
+        }
+    
+        return false;
+    }
+    
+    // ============================================================
+    // 内部锁方法（含死锁检测 + 重试逻辑）
+    // ============================================================
+    
+    bool TwoPLManager::LockSharedInternal(Transaction* txn, const std::string& record_id, int depth) {
+        constexpr int MAX_RETRY_DEPTH = 100;
+        if (depth > MAX_RETRY_DEPTH) {
+            return false;
+        }
+    
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        txn_id_t tid = txn->GetTransactionId();
+        auto& entry = lock_table_[record_id];
+    
+        // 情况1：当前事务已持有独占锁，允许共存
+        if (entry.exclusive_holder == tid) {
+            entry.shared_holders.insert(tid);
+            txn->AddSharedLock(record_id);
+            return true;
+        }
+    
+        // 情况2：无独占锁持有者，可以直接加共享锁
+        if (entry.exclusive_holder == -1) {
+            entry.shared_holders.insert(tid);
+            txn->AddSharedLock(record_id);
+            return true;
+        }
+    
+        // 情况3：冲突 —— 其他事务持有独占锁
+        txn_id_t blocker = entry.exclusive_holder;
+        waits_for_[tid].insert(blocker);
+    
+        // 死锁检测
+        bool had_cycle = DetectCycle(tid);
+    
+        if (had_cycle) {
+            // 死锁已解决，检查阻塞是否解除
+            auto check = lock_table_.find(record_id);
+            if (check == lock_table_.end() || check->second.exclusive_holder == -1) {
+                // 阻塞解除，重试
+                return LockSharedInternal(txn, record_id, depth + 1);
+            }
+        }
+    
+        return false;
+    }
+    
+    bool TwoPLManager::LockExclusiveInternal(Transaction* txn, const std::string& record_id, int depth) {
+        constexpr int MAX_RETRY_DEPTH = 100;
+        if (depth > MAX_RETRY_DEPTH) {
+            return false;
+        }
+    
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
+        txn_id_t tid = txn->GetTransactionId();
+        auto& entry = lock_table_[record_id];
+    
+        // 情况1：当前事务已持有独占锁
+        if (entry.exclusive_holder == tid) {
+            return true;
+        }
+    
+        // 情况2：无任何持有者
+        if (entry.exclusive_holder == -1 && entry.shared_holders.empty()) {
+            entry.exclusive_holder = tid;
+            entry.is_exclusive = true;
+            txn->AddExclusiveLock(record_id);
+            return true;
+        }
+    
+        // 检查是否可以锁升级（只有当前事务持有共享锁）
+        bool has_other_shared = false;
+        for (auto holder : entry.shared_holders) {
+            if (holder != tid) {
+                has_other_shared = true;
+                break;
+            }
+        }
+    
+        if (!has_other_shared && entry.exclusive_holder == -1) {
+            // 锁升级：清除共享锁，设置独占锁
+            entry.shared_holders.erase(tid);
+            entry.exclusive_holder = tid;
+            entry.is_exclusive = true;
+            txn->AddExclusiveLock(record_id);
+            return true;
+        }
+    
+        // 情况3：冲突 —— 有其他持有者
+        if (entry.exclusive_holder != -1 && entry.exclusive_holder != tid) {
+            waits_for_[tid].insert(entry.exclusive_holder);
+        }
+        for (auto holder : entry.shared_holders) {
+            if (holder != tid) {
+                waits_for_[tid].insert(holder);
+            }
+        }
+    
+        // 死锁检测
+        bool had_cycle = DetectCycle(tid);
+    
+        if (had_cycle) {
+            auto check = lock_table_.find(record_id);
+            if (check == lock_table_.end() ||
+                (check->second.exclusive_holder == -1 && check->second.shared_holders.empty())) {
+                return LockExclusiveInternal(txn, record_id, depth + 1);
+            }
+        }
+    
+        return false;
+    }
 
 bool TwoPLManager::UnlockAll(Transaction* txn) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
@@ -163,6 +332,8 @@ Transaction* TransactionManager::Begin(IsolationLevel iso_level) {
 }
 
 void TransactionManager::Commit(Transaction* txn) {
+    if (!txn) return;
+
     // 写入 COMMIT 日志记录（在释放锁之前，确保崩溃后可判定事务已提交）
     if (log_manager_) {
         LogRecord record;
@@ -175,8 +346,6 @@ void TransactionManager::Commit(Transaction* txn) {
         txn->SetPrevLSN(lsn);
     }
 
-    if (!txn) return;
-
     std::lock_guard<std::mutex> lock(mutex_);
 
     // 释放事务持有的所有锁（进入缩减阶段）
@@ -185,8 +354,19 @@ void TransactionManager::Commit(Transaction* txn) {
     // 从事务表中移除
     txn_map_.erase(txn->GetTransactionId());
 }
+    
+    Transaction* TransactionManager::GetTransaction(txn_id_t txn_id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = txn_map_.find(txn_id);
+        if (it != txn_map_.end()) {
+            return it->second.get();
+        }
+        return nullptr;
+    }
 
 void TransactionManager::Abort(Transaction* txn) {
+    if (!txn) return;
+
     // 写入 ABORT 日志记录（在释放锁之前）
     if (log_manager_) {
         LogRecord record;
@@ -198,8 +378,6 @@ void TransactionManager::Abort(Transaction* txn) {
         lsn_t lsn = log_manager_->AppendLogRecord(record);
         txn->SetPrevLSN(lsn);
     }
-
-    if (!txn) return;
 
     std::lock_guard<std::mutex> lock(mutex_);
 

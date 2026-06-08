@@ -1,4 +1,4 @@
-﻿#include "db_engine.h"
+#include "db_engine.h"
 #include "storage/file_disk_manager.h"
 #include "storage/file_log_manager.h"
 #include "storage/table_iterator.h"
@@ -22,6 +22,8 @@ DBEngine::DBEngine(const std::string& db_file, size_t buffer_pool_size) {
     // 4. 创建锁管理器与事务管理器
     lock_manager_ = std::make_unique<TwoPLManager>();
     txn_manager_ = std::make_unique<TransactionManager>(lock_manager_.get(), log_manager_.get());
+
+    lock_manager_->SetTransactionManager(txn_manager_.get());
 
     // 5. 创建 SQL 解析器
     parser_ = std::make_unique<SQLParser>();
@@ -66,7 +68,8 @@ void DBEngine::DoRecovery() {
     // 1. 读取 WAL 中所有日志记录
     auto records = log_manager_->ReadLogRecords();
     if (records.empty()) {
-        return; // WAL 为空，无需恢复
+        std::cout << "[Recovery] No log records found, skipping recovery." << std::endl;
+        return;
     }
 
     // 2. 构建事务状态表：每个 txn_id 的最终状态
@@ -85,7 +88,20 @@ void DBEngine::DoRecovery() {
         }
     }
 
-    // 3. REDO：按 LSN 顺序重放已提交事务的操作
+    // 3. 收集活跃但无终止标记的事务（崩溃时正在运行的事务）
+    //    按 ARIES 协议，未提交事务应视为 aborted 并执行 UNDO
+    for (const auto& rec : records) {
+        if (rec.op_type == LogOpType::INSERT ||
+            rec.op_type == LogOpType::DELETE ||
+            rec.op_type == LogOpType::UPDATE) {
+            txn_id_t tid = rec.txn_id;
+            if (committed_txns.count(tid) == 0 && aborted_txns.count(tid) == 0) {
+                aborted_txns.insert(tid);
+            }
+        }
+    }
+
+    // 4. REDO：按 LSN 顺序重放已提交事务的操作
     for (const auto& rec : records) {
         if (committed_txns.count(rec.txn_id) == 0) {
             continue; // 跳过未提交/已中止的事务
@@ -128,17 +144,68 @@ void DBEngine::DoRecovery() {
         buffer_pool_manager_->UnpinPage(rec.page_id, true);
     }
 
-    // 4. 将恢复后的所有脏页刷盘
-    buffer_pool_manager_->FlushAllPages();
+    // 5. UNDO：反向遍历 WAL，回滚未提交事务的修改
+    if (!aborted_txns.empty()) {
+        // 反向遍历（后进先出），对每个未提交事务的操作执行补偿操作
+        for (auto it = records.rbegin(); it != records.rend(); ++it) {
+            const auto& rec = *it;
+            if (aborted_txns.count(rec.txn_id) == 0) {
+                continue; // 跳过已提交/已恢复的事务
+            }
 
-    // 5. 截断 WAL（恢复完成后日志可丢弃）
-    if (!records.empty()) {
-        lsn_t last_lsn = records.back().lsn;
-        log_manager_->TruncateAfter(last_lsn);
+            // 只处理数据操作，跳过控制记录（BEGIN/COMMIT/ABORT）
+            if (rec.op_type != LogOpType::INSERT &&
+                rec.op_type != LogOpType::DELETE &&
+                rec.op_type != LogOpType::UPDATE) {
+                continue;
+            }
+
+            // 获取目标页面
+            Page* page = buffer_pool_manager_->FetchPage(rec.page_id);
+            if (!page) {
+                std::cerr << "[Recovery] UNDO: failed to fetch page "
+                          << rec.page_id << ", skipping." << std::endl;
+                continue;
+            }
+
+            auto* tp = reinterpret_cast<TablePage*>(page);
+
+            switch (rec.op_type) {
+            case LogOpType::INSERT:
+                // UNDO INSERT：标记删除已插入的元组
+                tp->MarkDelete(rec.slot_num);
+                break;
+            case LogOpType::DELETE:
+                // UNDO DELETE：重新插入被删除的旧元组
+                if (rec.old_tuple.GetSize() > 0) {
+                    tp->InsertTuple(rec.old_tuple, nullptr);
+                }
+                break;
+            case LogOpType::UPDATE:
+                // UNDO UPDATE：将元组恢复为旧值
+                if (rec.old_tuple.GetSize() > 0) {
+                    tp->UpdateTuple(rec.slot_num, rec.old_tuple);
+                }
+                break;
+            default:
+                break;
+            }
+
+            buffer_pool_manager_->UnpinPage(rec.page_id, true);
+        }
     }
 
-    std::cout << "[Recovery] REDO complete: " << committed_txns.size()
-              << " committed transactions recovered." << std::endl;
+    // 6. 将恢复后的所有脏页刷盘
+    buffer_pool_manager_->FlushAllPages();
+
+    // 7. 截断 WAL（恢复完成后日志可丢弃）
+    lsn_t last_lsn = records.back().lsn;
+    log_manager_->TruncateAfter(last_lsn);
+
+    // 8. 输出恢复摘要
+    std::cout << "[Recovery] REDO " << committed_txns.size()
+              << " committed + UNDO " << aborted_txns.size()
+              << " aborted transactions recovered." << std::endl;
 }
 
 void DBEngine::ExecuteQuery(const std::string& sql) {

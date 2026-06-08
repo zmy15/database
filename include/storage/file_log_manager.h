@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "storage/log_manager.h"
 #include "storage/disk_manager.h"
@@ -45,6 +45,9 @@ private:
 
     // 从文件当前位置读取一条日志记录
     std::optional<LogRecord> ReadSingleRecord();
+
+    // 不加锁的内部刷盘版本，仅供已持有 mutex_ 的方法调用（避免 std::mutex 重入死锁）
+    void FlushLogsInternal();
 
     static constexpr size_t kWriteBufferSize = 4096 * 4; // 16KB 写缓冲
 

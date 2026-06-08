@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "storage/disk_manager.h"
 #include "storage/log_manager.h"
@@ -23,8 +23,7 @@ namespace db {
  */
 class DBEngine {
 public:
-
-    // 崩溃恢复：扫描 WAL 日志，REDO 已提交事务，跳过未提交事务
+    // 崩溃恢复：扫描 WAL 日志，REDO 已提交事务，UNDO 未提交事务
     void DoRecovery();
     DBEngine(const std::string& db_file, size_t buffer_pool_size = 64);
     ~DBEngine();

@@ -1,4 +1,4 @@
-﻿# 🗄️ Micro Database Engine — 微型关系数据库引擎
+# 🗄️ Micro Database Engine — 微型关系数据库引擎
 
 一个使用 **C++20** 从零构建的微型关系数据库引擎，旨在深入理解数据库内核实现原理，涵盖存储引擎、缓冲池、B+ 树索引、SQL 解析执行、事务与并发控制等核心模块。
 
@@ -135,14 +135,15 @@ SeqScanExecutor → FilterExecutor → ProjectionExecutor
 ### 6. WAL 崩溃恢复
 - 启动时读取所有 WAL 日志记录
 - 识别已提交/已中止事务
-- REDO: 重放已提交的 INSERT/DELETE/UPDATE
+- REDO: 重放已提交事务的 INSERT/DELETE/UPDATE
+- UNDO: 回滚未提交事务（含崩溃时无 COMMIT/ABORT 记录的活跃事务）
 - 恢复后刷新所有脏页并截断 WAL 文件
 
 ### 7. 两阶段锁 (2PL) 并发控制
 - `TwoPLManager`: 支持共享锁 (S) 和排他锁 (X)
 - `TransactionManager`: BEGIN → 操作 → COMMIT/ABORT
 - 隔离级别：READ_COMMITTED / REPEATABLE_READ / SERIALIZABLE
-- 锁表：基于 RID 的锁条目，跟踪持有者
+- 锁表：基于表名（string key）的锁条目，跟踪持有者；事务锁集合类型与锁表统一
 
 > ⚠️ 当前为单线程设计，锁管理器接口已就绪但尚未完全接入多线程环境。
 
@@ -192,14 +193,36 @@ ctest --preset x64-debug
 
 ## 📋 已知限制 (TODO)
 
-- 单线程设计（锁管理器未完全适配多线程）
-- 不支持 JOIN 操作
-- 不支持子查询 / 嵌套查询
-- 所有值以字符串存储，无类型系统
-- 无预编译语句
-- 无基于代价的查询优化器
-- 无网络协议层
-- 缺失 SQL 特性: DISTINCT, LIMIT, HAVING, ORDER BY 等
+### 🔴 严重缺失
+- **隔离级别**：`IsolationLevel` 枚举定义了 `READ_COMMITTED`/`REPEATABLE_READ`/`SERIALIZABLE` 三种级别，但**所有代码路径行为完全相同**，无 MVCC、无快照隔离
+
+### ✅ 已修复 (v1.1)
+- **编译错误**：~~`LockExclusiveInternal` 末尾重构残留导致编译失败~~ → ✅ 闭合大括号缩进已修正，与 `LockSharedInternal` 保持一致
+- **死锁检测失效**：~~构造函数未调用 `lock_manager_->SetTransactionManager()`~~ → ✅ 已添加调用，并在 `LockManager` 基类声明纯虚方法
+- **恢复缺陷**：~~无 COMMIT/ABORT 记录的活跃事务在 `DoRecovery()` 中被遗漏~~ → ✅ 按 ARIES 协议，活跃但无终止标记的事务归入 `aborted_txns` 并进入 UNDO 回滚
+- **Commit/Abort 空指针检查**：~~`if (!txn) return;` 在 `txn->` 解引用之后~~ → ✅ 空指针检查移至函数体最开头
+- **锁集合类型统一**：~~`Transaction` 锁集合使用 `RID`，与锁表 `string` key 不一致，6 处 `RID(0,0)` 硬编码~~ → ✅ 锁集合改为 `std::unordered_set<std::string>`，统一使用 `record_id`
+
+### 🟡 功能缺失
+- **死锁检测**：已实现（BFS 环路检测 + 受害者选择 + 自动中止重试），并有 2 个单元测试覆盖，但尚未在多线程生产环境下验证，`BufferPoolManager` 和 B+树仍使用全局大锁
+- **崩溃恢复 (ARIES)**：基础 REDO/UNDO 恢复已实现（`DoRecovery()` 按 LSN 顺序 REDO 已提交事务、反向 UNDO 未提交事务），但缺少 ARIES 完整协议特性：检查点(Checkpoint)、CLR 补偿日志记录、分析阶段(Analysis Phase)
+-- **SQL 特性缺失**：
+  - `JOIN` — 无 Join 算子，解析器仅支持单表 FROM
+  - `ORDER BY` — `SelectStmt` 中声明了字段但 SQL 解析器不解析
+  - `GROUP BY` — 同 ORDER BY，字段声明存在但解析器不设置（`AggregateExecutor` 内部已支持哈希分组逻辑）
+  - `DISTINCT` / `LIMIT` / `HAVING` — 完全未实现
+  - `DROP TABLE` — B+树 `Drop()` 方法已实现，但 SQL 解析器不支持该语句
+  - 子查询 / 嵌套查询 — 完全未实现
+- **类型系统**：所有列值以 `std::string` 存储，无 INT/FLOAT/DATE 等类型区分（WHERE 比较时尝试智能数值比较作为补偿）
+- **查询优化器**：仅基于简单规则（单等值条件 → IndexScan，否则 SeqScan），无基于代价的优化器 (CBO)
+- **预编译语句** (Prepared Statements)：完全未实现
+- **网络协议层**：无可远程访问的网络接口
+
+### 🟢 待改进
+- **B+树空间回收**：`Remove()` 仅标记删除（size 置 0），节点不合并、垃圾不回收，树只增长不收缩
+- **磁盘页回收**：`FileDiskManager::DeallocatePage()` 仅将页面清零，未维护空闲页链表/位图
+- **CI/CD**：`.github/workflows/` 为空目录，无自动化构建/测试流水线
+- **遗留文件**：`test/storage/CMakeLists.txt` 已全部注释（测试定义已迁移到根 `CMakeLists.txt`），可清理
 
 ## 🤝 贡献
 

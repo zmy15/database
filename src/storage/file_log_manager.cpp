@@ -1,4 +1,4 @@
-﻿#include "storage/file_log_manager.h"
+#include "storage/file_log_manager.h"
 #include <cstring>
 #include <iostream>
 
@@ -68,20 +68,7 @@ lsn_t FileLogManager::AppendLogRecord(const LogRecord& record) {
 
 void FileLogManager::FlushLogs() {
     std::lock_guard<std::mutex> lock(mutex_);
-
-    // 将写缓冲区刷入文件
-    if (!write_buffer_.empty()) {
-        wal_file_.write(write_buffer_.data(), write_buffer_.size());
-        write_buffer_.clear();
-    }
-
-    // fsync：强制将文件数据写入磁盘
-    wal_file_.flush();
-
-    // 更新 flushed_lsn_（已刷盘的最后一条 LSN）
-    if (next_lsn_ > 0) {
-        flushed_lsn_ = next_lsn_ - 1;
-    }
+    FlushLogsInternal();
 }
 
 lsn_t FileLogManager::GetFlushedLSN() const {
@@ -240,11 +227,27 @@ std::optional<LogRecord> FileLogManager::ReadSingleRecord() {
     return rec;
 }
 
+void FileLogManager::FlushLogsInternal() {
+    // 将写缓冲区刷入文件
+    if (!write_buffer_.empty()) {
+        wal_file_.write(write_buffer_.data(), write_buffer_.size());
+        write_buffer_.clear();
+    }
+
+    // fsync：强制将文件数据写入磁盘
+    wal_file_.flush();
+
+    // 更新 flushed_lsn_（已刷盘的最后一条 LSN）
+    if (next_lsn_ > 0) {
+        flushed_lsn_ = next_lsn_ - 1;
+    }
+}
+
 void FileLogManager::TruncateAfter(lsn_t target_lsn) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     // 先刷盘确保数据一致
-    FlushLogs();
+    FlushLogsInternal();
 
     // 找到 target_lsn 之后的位置并截断
     // 简化实现：重新打开文件，截断到目标位置
