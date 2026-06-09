@@ -1,4 +1,4 @@
-#include "db_engine.h"
+﻿#include "db_engine.h"
 #include <iostream>
 #include <string>
 #include <system_error>
@@ -157,10 +157,29 @@ int main() {
         engine.ExecuteQuery("INSERT INTO products VALUES ('999', 'TxnProduct', '99.99')");
         engine.ExecuteQuery("SELECT * FROM products WHERE pid = '999'");
         engine.ExecuteQuery("ABORT");
-        std::cout << "After ABORT (注: 当前 DML 独立提交, ABORT 不回滚数据):" << std::endl;
+        std::cout << "After ABORT (事务已回滚, 数据不应存在):" << std::endl;
         engine.ExecuteQuery("SELECT * FROM products WHERE pid = '999'");
         engine.ExecuteQuery("BEGIN");
         engine.ExecuteQuery("COMMIT");
+
+        // ==========================================
+        // 测试 DROP TABLE
+        // ==========================================
+        std::cout << "\n=== [Test DROP TABLE] ===" << std::endl;
+        // 创建临时表
+        engine.ExecuteQuery("CREATE TABLE temp_drop (col1, col2)");
+        engine.ExecuteQuery("INSERT INTO temp_drop VALUES ('hello', 'world')");
+        engine.ExecuteQuery("INSERT INTO temp_drop VALUES ('foo', 'bar')");
+        std::cout << "Before DROP:" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM temp_drop");
+        // 执行 DROP TABLE
+        engine.ExecuteQuery("DROP TABLE temp_drop");
+        // 验证表已删除（应报错）
+        std::cout << "After DROP (expect error):" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM temp_drop");
+        // 验证 DROP 不存在的表应报错
+        std::cout << "DROP non-existent table (expect error):" << std::endl;
+        engine.ExecuteQuery("DROP TABLE non_existent");
 
         std::cout << "\n=== All Tests Complete ===" << std::endl;
         return 0;

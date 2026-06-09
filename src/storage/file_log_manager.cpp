@@ -1,4 +1,4 @@
-#include "storage/file_log_manager.h"
+﻿#include "storage/file_log_manager.h"
 #include <cstring>
 #include <iostream>
 
@@ -83,10 +83,12 @@ void FileLogManager::WriteRecordToFile(const LogRecord& record) {
     // 序列化格式：
     // [lsn (4B)] [txn_id (4B)] [op_type (1B)] [page_id (4B)] [slot_num (4B)]
     // [prev_lsn (4B)]
+    // [table_name: len (4B) + data]
     // [old_tuple: size (4B) + data]
     // [new_tuple: size (4B) + data]
     // [record_size (4B)]
 
+    uint32_t table_name_len = static_cast<uint32_t>(record.table_name.size());
     uint32_t old_tuple_size = record.old_tuple.GetSize();
     uint32_t new_tuple_size = record.new_tuple.GetSize();
 
@@ -103,6 +105,7 @@ void FileLogManager::WriteRecordToFile(const LogRecord& record) {
     // 计算整条记录大小
     uint32_t record_size = sizeof(lsn_t) + sizeof(txn_id_t) + sizeof(uint8_t)
                          + sizeof(page_id_t) + sizeof(uint32_t) + sizeof(lsn_t)
+                         + sizeof(uint32_t) + table_name_len
                          + sizeof(uint32_t) + old_tuple_size
                          + sizeof(uint32_t) + new_tuple_size
                          + sizeof(uint32_t); // record_size 自身
@@ -131,6 +134,11 @@ void FileLogManager::WriteRecordToFile(const LogRecord& record) {
     append_bytes(&record.page_id, sizeof(page_id_t));
     append_bytes(&record.slot_num, sizeof(uint32_t));
     append_bytes(&record.prev_lsn, sizeof(lsn_t));
+
+    append_bytes(&table_name_len, sizeof(uint32_t));
+    if (table_name_len > 0) {
+        append_bytes(record.table_name.data(), table_name_len);
+    }
 
     append_bytes(&old_tuple_size, sizeof(uint32_t));
     if (old_tuple_size > 0) {
@@ -176,6 +184,7 @@ std::optional<LogRecord> FileLogManager::ReadSingleRecord() {
     // 记录格式：
     // [lsn (4B)] [txn_id (4B)] [op_type (1B)] [page_id (4B)] [slot_num (4B)]
     // [prev_lsn (4B)]
+    // [table_name_len (4B)] [table_name_data...]
     // [old_tuple_size (4B)] [old_tuple_data...]
     // [new_tuple_size (4B)] [new_tuple_data...]
     // [record_size (4B)]
@@ -194,6 +203,18 @@ std::optional<LogRecord> FileLogManager::ReadSingleRecord() {
     if (!wal_file_.good()) return std::nullopt;
 
     rec.op_type = static_cast<LogOpType>(op_byte);
+
+    // 读取 table_name
+    uint32_t table_name_len = 0;
+    wal_file_.read(reinterpret_cast<char*>(&table_name_len), sizeof(uint32_t));
+    if (!wal_file_.good()) return std::nullopt;
+
+    if (table_name_len > 0) {
+        std::vector<char> name_buf(table_name_len);
+        wal_file_.read(name_buf.data(), table_name_len);
+        if (!wal_file_.good()) return std::nullopt;
+        rec.table_name.assign(name_buf.data(), table_name_len);
+    }
 
     // 读取 old_tuple
     uint32_t old_size = 0;

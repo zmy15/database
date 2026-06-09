@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "common/config.h"
 #include "storage/tuple.h"
@@ -20,6 +20,7 @@ struct LogRecord {
     lsn_t lsn;               // 本条日志的 LSN
     txn_id_t txn_id;         // 所属事务 ID
     LogOpType op_type;       // 操作类型
+    std::string table_name;  // 所属表名（用于索引恢复）
     page_id_t page_id;       // 受影响的页 ID
     uint32_t slot_num;       // 受影响的槽位号
     Tuple old_tuple;         // 旧值（UNDO 用，DELETE/UPDATE 时有效）

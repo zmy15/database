@@ -20,7 +20,8 @@ enum class SQLStmtType {
     UPDATE,
     BEGIN_TXN,   // 开始多语句事务
     COMMIT_TXN,  // 提交事务
-    ABORT_TXN    // 中止事务 / 回滚
+    ABORT_TXN,   // 中止事务 / 回滚
+    DROP_TABLE   // 删除表
 };
 
 // AST 基类
@@ -83,6 +84,13 @@ struct AbortStmt : SQLStmt {
     AbortStmt() { type = SQLStmtType::ABORT_TXN; }
 };
 
+// ============ DDL 删除表 AST 节点 ============
+
+struct DropTableStmt : SQLStmt {
+    std::string table_name;
+    DropTableStmt() { type = SQLStmtType::DROP_TABLE; }
+};
+
 // ============ SQL 解析器 ============
 
 class SQLParser {
@@ -94,6 +102,9 @@ public:
 
         if (upper.find("CREATE TABLE ") == 0) {
             return ParseCreateTable(sql);
+        }
+        if (upper.find("DROP TABLE ") == 0) {
+            return ParseDropTable(sql);
         }
         if (upper.find("INSERT INTO ") == 0) {
             return ParseInsert(sql);
@@ -582,6 +593,22 @@ public:
                 stmt->iso_level = IsolationLevel::SERIALIZABLE;
             }
         }
+        return stmt;
+    }
+
+    // 解析 DROP TABLE <table_name>
+    std::unique_ptr<SQLStmt> ParseDropTable(const std::string& sql) {
+        std::string s = Trim(sql);
+        // 跳过 "DROP TABLE " 前缀（长度 11），提取表名
+        size_t pos = 11;
+        while (pos < s.size() && std::isspace(static_cast<unsigned char>(s[pos]))) ++pos;
+        std::string table_name;
+        while (pos < s.size() && !std::isspace(static_cast<unsigned char>(s[pos])) && s[pos] != ';') {
+            table_name += s[pos];
+            ++pos;
+        }
+        auto stmt = std::make_unique<DropTableStmt>();
+        stmt->table_name = table_name;
         return stmt;
     }
 

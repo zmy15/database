@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "storage/disk_manager.h"
 #include "storage/log_manager.h"
@@ -37,6 +37,9 @@ public:
 private:
     // 注册/查找表
     TableHeap* GetOrCreateTable(const std::string& table_name);
+
+    // 对指定事务执行 UNDO 回滚（读取 WAL → 逆序补偿 → 恢复索引）
+    void ApplyUndoForTransaction(txn_id_t txn_id);
 
     std::unique_ptr<DiskManager> disk_manager_;
     std::unique_ptr<LogManager> log_manager_;

@@ -1,6 +1,6 @@
-#include "storage/table_heap.h"
+﻿#include "storage/table_heap.h"
 #include "storage/table_iterator.h"
-#include <cstring>
+#include <vector>
 
 namespace db {
 
@@ -40,16 +40,24 @@ void TableHeap::Load(page_id_t first_page_id) {
 }
 
 void TableHeap::Drop() {
+    // 1. 收集所有页 ID
+    std::vector<page_id_t> all_pages;
     page_id_t current = first_page_id_;
     while (current != INVALID_PAGE_ID) {
         Page* page = bpm_->FetchPage(current);
         if (!page) break;
         auto* tp = reinterpret_cast<TablePage*>(page);
+        all_pages.push_back(current);
         page_id_t next = tp->GetNextPageId();
-        std::memset(page->GetData(), 0, PAGE_SIZE);
-        bpm_->UnpinPage(current, true);
+        bpm_->UnpinPage(current, false);
         current = next;
     }
+
+    // 2. 删除所有页面（回收磁盘空间）
+    for (page_id_t pid : all_pages) {
+        bpm_->DeletePage(pid);
+    }
+
     first_page_id_ = INVALID_PAGE_ID;
     last_page_id_ = INVALID_PAGE_ID;
 }
