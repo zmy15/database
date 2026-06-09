@@ -52,6 +52,9 @@ private:
     // 索引目录：表名 → B+ 树索引（默认对第一列建索引）
     std::unordered_map<std::string, std::unique_ptr<BPlusTree>> indexes_;
 
+    // 当前活跃的多语句事务（BEGIN 时设置，COMMIT/ABORT 后清空）
+    Transaction* current_txn_ = nullptr;
+
     // 表模式：表名 → 列名列表（CREATE TABLE 时注册）
     std::unordered_map<std::string, std::vector<std::string>> table_schemas_;
 };

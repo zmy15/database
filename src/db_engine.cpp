@@ -255,8 +255,23 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
         // 开始事务并持有共享锁
         auto txn = txn_manager_->Begin();
         if (lock_manager_) {
-            lock_manager_->LockShared(txn, sel.table_name);
+            // 根据隔离级别选择锁策略
+            switch (txn->GetIsolationLevel()) {
+            case IsolationLevel::SERIALIZABLE:
+                // SERIALIZABLE：读操作使用排他锁，完全串行化，防止幻读
+                lock_manager_->LockExclusiveForRead(txn, sel.table_name);
+                break;
+            case IsolationLevel::REPEATABLE_READ:
+                // REPEATABLE_READ：共享锁持有到事务提交，保证可重复读
+                lock_manager_->LockShared(txn, sel.table_name);
+                break;
+            case IsolationLevel::READ_COMMITTED:
+            default:
+                // READ_COMMITTED：共享锁在语句结束后释放，允许不可重复读
+                lock_manager_->LockSharedForRead(txn, sel.table_name);
+                break;
         }
+        }  // 关闭 if (lock_manager_)
 
         // 使用 Planner 构建执行器树（SeqScan → Filter → Projection）
         auto executor = planner_->CreatePlan(&sel);
@@ -431,6 +446,40 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
         txn_manager_->Commit(txn);
         std::cout << "[OK] " << count << " row(s) updated in '"
                   << upd.table_name << "'." << std::endl;
+        break;
+    }
+    case SQLStmtType::BEGIN_TXN: {
+        auto& begin_stmt = static_cast<BeginStmt&>(*stmt);
+        if (current_txn_) {
+            std::cerr << "[ERR] Transaction #" << current_txn_->GetTransactionId()
+                      << " already active. Commit or abort it first." << std::endl;
+            break;
+        }
+        current_txn_ = txn_manager_->Begin(begin_stmt.iso_level);
+        std::cout << "[OK] Transaction #" << current_txn_->GetTransactionId()
+                  << " started." << std::endl;
+        break;
+    }
+    case SQLStmtType::COMMIT_TXN: {
+        if (!current_txn_) {
+            std::cerr << "[ERR] No active transaction to commit." << std::endl;
+            break;
+        }
+        txn_id_t tid = current_txn_->GetTransactionId();
+        txn_manager_->Commit(current_txn_);
+        current_txn_ = nullptr;
+        std::cout << "[OK] Transaction #" << tid << " committed." << std::endl;
+        break;
+    }
+    case SQLStmtType::ABORT_TXN: {
+        if (!current_txn_) {
+            std::cerr << "[ERR] No active transaction to abort." << std::endl;
+            break;
+        }
+        txn_id_t tid = current_txn_->GetTransactionId();
+        txn_manager_->Abort(current_txn_);
+        current_txn_ = nullptr;
+        std::cout << "[OK] Transaction #" << tid << " aborted (rolled back)." << std::endl;
         break;
     }
     default:

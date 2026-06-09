@@ -2,6 +2,7 @@
 
 #include "storage/tuple.h"
 #include "execution/expression.h"
+#include "concurrency/transaction.h"
 #include <string>
 #include <sstream>
 #include <vector>
@@ -16,7 +17,10 @@ enum class SQLStmtType {
     INSERT,
     SELECT,
     DELETE,
-    UPDATE
+    UPDATE,
+    BEGIN_TXN,   // 开始多语句事务
+    COMMIT_TXN,  // 提交事务
+    ABORT_TXN    // 中止事务 / 回滚
 };
 
 // AST 基类
@@ -64,12 +68,25 @@ struct UpdateStmt : SQLStmt {
     UpdateStmt() { type = SQLStmtType::UPDATE; }
 };
 
+// ============ 事务控制 AST 节点 ============
+
+struct BeginStmt : SQLStmt {
+    IsolationLevel iso_level = IsolationLevel::READ_COMMITTED;
+    BeginStmt() { type = SQLStmtType::BEGIN_TXN; }
+};
+
+struct CommitStmt : SQLStmt {
+    CommitStmt() { type = SQLStmtType::COMMIT_TXN; }
+};
+
+struct AbortStmt : SQLStmt {
+    AbortStmt() { type = SQLStmtType::ABORT_TXN; }
+};
+
 // ============ SQL 解析器 ============
 
 class SQLParser {
 public:
-    SQLParser() = default;
-
     // 解析 SQL 字符串，返回 AST 根节点
     std::unique_ptr<SQLStmt> Parse(const std::string& sql) {
         std::string s = Trim(sql);
@@ -89,6 +106,16 @@ public:
         }
         if (upper.find("UPDATE ") == 0) {
             return ParseUpdate(sql);
+        }
+        // 多语句事务控制
+        if (upper == "BEGIN" || upper.find("BEGIN ") == 0) {
+            return ParseBegin(sql);
+        }
+        if (upper == "COMMIT") {
+            return std::make_unique<CommitStmt>();
+        }
+        if (upper == "ABORT" || upper == "ROLLBACK") {
+            return std::make_unique<AbortStmt>();
         }
         return nullptr;
     }
@@ -350,7 +377,7 @@ public:
     }
 
     std::unique_ptr<SQLStmt> ParseSelect(const std::string& sql) {
-        // 格式: SELECT <cols> FROM <name> [WHERE <condition>]
+        // 格式: SELECT <cols> FROM <name> [WHERE <cond>] [GROUP BY <cols>] [ORDER BY <col> [ASC|DESC]]
         auto stmt = std::make_unique<SelectStmt>();
 
         std::string s = Trim(sql);
@@ -375,18 +402,76 @@ public:
             }
         }
 
+        // 检测聚合函数（COUNT/SUM/AVG/MIN/MAX），设置 has_aggregation 标志
+        for (const auto& col : stmt->columns) {
+            std::string upper_col = ToUpper(col);
+            if (upper_col.find("COUNT(") == 0 || upper_col.find("SUM(") == 0 ||
+                upper_col.find("AVG(") == 0 || upper_col.find("MIN(") == 0 ||
+                upper_col.find("MAX(") == 0) {
+                stmt->has_aggregation = true;
+                break;
+            }
+        }
+
         std::string after_from = s.substr(from_pos + 6);
 
-        // 检查是否有 WHERE 子句
         std::string upper_after = ToUpper(after_from);
+        // 查找各子句位置（WHERE, GROUP BY, ORDER BY）
         size_t where_pos = upper_after.find(" WHERE ");
+        size_t group_pos = upper_after.find(" GROUP BY ");
+        size_t order_pos = upper_after.find(" ORDER BY ");
 
-        if (where_pos != std::string::npos) {
-            stmt->table_name = Trim(after_from.substr(0, where_pos));
-            std::string where_clause = Trim(after_from.substr(where_pos + 7));
-            stmt->condition = ParseCondition(where_clause);
+        // 确定表名结束位置（取最小的子句起始位置）
+        size_t table_end = std::string::npos;
+        if (where_pos != std::string::npos) table_end = where_pos;
+        if (group_pos != std::string::npos && (table_end == std::string::npos || group_pos < table_end)) table_end = group_pos;
+        if (order_pos != std::string::npos && (table_end == std::string::npos || order_pos < table_end)) table_end = order_pos;
+
+        if (table_end != std::string::npos) {
+            stmt->table_name = Trim(after_from.substr(0, table_end));
         } else {
             stmt->table_name = Trim(after_from);
+        }
+
+        // 解析 WHERE 子句（在 GROUP BY / ORDER BY 之前截断）
+        if (where_pos != std::string::npos) {
+            size_t where_end = after_from.size();
+            if (group_pos != std::string::npos && group_pos > where_pos) where_end = group_pos;
+            else if (order_pos != std::string::npos && order_pos > where_pos) where_end = order_pos;
+            std::string where_clause = Trim(after_from.substr(where_pos + 7, where_end - where_pos - 7));
+            stmt->condition = ParseCondition(where_clause);
+        }
+
+        // 解析 GROUP BY 子句
+        if (group_pos != std::string::npos) {
+            size_t group_end = after_from.size();
+            if (order_pos != std::string::npos && order_pos > group_pos) group_end = order_pos;
+            std::string group_str = Trim(after_from.substr(group_pos + 10, group_end - group_pos - 10));
+            size_t gs = 0;
+            while (gs < group_str.size()) {
+                size_t comma = group_str.find(',', gs);
+                std::string col = Trim(group_str.substr(gs, comma - gs));
+                if (!col.empty()) stmt->group_by_cols.push_back(col);
+                if (comma == std::string::npos) break;
+                gs = comma + 1;
+            }
+        }
+
+        // 解析 ORDER BY 子句
+        if (order_pos != std::string::npos) {
+            std::string order_str = Trim(after_from.substr(order_pos + 10));
+            std::string upper_order = ToUpper(order_str);
+            size_t desc_pos = upper_order.rfind(" DESC");
+            size_t asc_pos = upper_order.rfind(" ASC");
+            if (desc_pos != std::string::npos && desc_pos + 5 == upper_order.size()) {
+                stmt->order_desc = true;
+                stmt->order_by_col = Trim(order_str.substr(0, desc_pos));
+            } else if (asc_pos != std::string::npos && asc_pos + 4 == upper_order.size()) {
+                stmt->order_desc = false;
+                stmt->order_by_col = Trim(order_str.substr(0, asc_pos));
+            } else {
+                stmt->order_by_col = Trim(order_str);
+            }
         }
 
         return stmt;
@@ -480,6 +565,26 @@ public:
         if (stmt->col_names.empty()) return nullptr;
         return stmt;
     }
+    std::unique_ptr<SQLStmt> ParseBegin(const std::string& sql) {
+        auto stmt = std::make_unique<BeginStmt>();
+        std::string s = Trim(sql);
+        std::string upper = ToUpper(s);
+        // 检查是否指定了隔离级别：BEGIN TRANSACTION ISOLATION LEVEL <level>
+        size_t iso_pos = upper.find(" ISOLATION LEVEL ");
+        if (iso_pos != std::string::npos) {
+            std::string level_str = Trim(s.substr(iso_pos + 17));
+            std::string upper_level = ToUpper(level_str);
+            if (upper_level == "READ COMMITTED") {
+                stmt->iso_level = IsolationLevel::READ_COMMITTED;
+            } else if (upper_level == "REPEATABLE READ") {
+                stmt->iso_level = IsolationLevel::REPEATABLE_READ;
+            } else if (upper_level == "SERIALIZABLE") {
+                stmt->iso_level = IsolationLevel::SERIALIZABLE;
+            }
+        }
+        return stmt;
+    }
+
 };
 
 } // namespace db

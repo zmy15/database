@@ -1,4 +1,4 @@
-﻿#include "db_engine.h"
+#include "db_engine.h"
 #include <iostream>
 #include <string>
 #include <system_error>
@@ -102,6 +102,65 @@ int main() {
         // ==========================================
         std::cout << "\n=== [Test] SELECT * FROM users ===" << std::endl;
         engine.ExecuteQuery("SELECT * FROM users");
+
+        // ==========================================
+        // 测试 10: 复杂 WHERE 条件 (AND / OR / 数值比较)
+        // ==========================================
+        std::cout << "\n=== [Test 10] Complex WHERE conditions ===" << std::endl;
+        std::cout << "--- AND condition ---" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM users WHERE name = 'User_10' AND data = 'UPDATED'");
+        std::cout << "--- OR condition ---" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM users WHERE name = 'User_1' OR name = 'User_2'");
+        std::cout << "--- Numeric comparison (>  <) ---" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM products WHERE price > '50'");
+        engine.ExecuteQuery("SELECT * FROM products WHERE price < '200'");
+        std::cout << "--- Combined AND + numeric ---" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM products WHERE price > '50' AND price < '500'");
+        std::cout << "--- NOT_EQUAL (<>) ---" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM products WHERE pname <> 'Monitor'");
+
+        // ==========================================
+        // 测试 11: 聚合查询 (COUNT / SUM / AVG / MIN / MAX)
+        // ==========================================
+        std::cout << "\n=== [Test 11] Aggregate Queries ===" << std::endl;
+        engine.ExecuteQuery("SELECT COUNT(*) FROM users");
+        engine.ExecuteQuery("SELECT COUNT(pname) FROM products");
+        engine.ExecuteQuery("SELECT SUM(price) FROM products");
+        engine.ExecuteQuery("SELECT AVG(price) FROM products");
+        engine.ExecuteQuery("SELECT MIN(price) FROM products");
+        engine.ExecuteQuery("SELECT MAX(price) FROM products");
+
+        // ==========================================
+        // 测试 12: GROUP BY + ORDER BY
+        // ==========================================
+        std::cout << "\n=== [Test 12] GROUP BY ===" << std::endl;
+        engine.ExecuteQuery("SELECT data, COUNT(*) FROM users GROUP BY data");
+        std::cout << "\n--- ORDER BY ASC ---" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM products ORDER BY price");
+        std::cout << "\n--- ORDER BY DESC ---" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM products ORDER BY price DESC");
+
+        // ==========================================
+        // 测试 13: 条件 UPDATE（带 WHERE 的更新）
+        // ==========================================
+        std::cout << "\n=== [Test 13] Conditional UPDATE ===" << std::endl;
+        engine.ExecuteQuery("UPDATE users SET data = 'SPECIAL' WHERE name = 'User_5'");
+        engine.ExecuteQuery("SELECT * FROM users WHERE name = 'User_5'");
+        engine.ExecuteQuery("UPDATE users SET data = 'RESTORED' WHERE name = 'User_5'");
+        std::cout << "Restored User_5 data." << std::endl;
+
+        // ==========================================
+        // 测试 14: 事务控制 (BEGIN / COMMIT / ABORT)
+        // ==========================================
+        std::cout << "\n=== [Test 14] Transaction Control ===" << std::endl;
+        engine.ExecuteQuery("BEGIN");
+        engine.ExecuteQuery("INSERT INTO products VALUES ('999', 'TxnProduct', '99.99')");
+        engine.ExecuteQuery("SELECT * FROM products WHERE pid = '999'");
+        engine.ExecuteQuery("ABORT");
+        std::cout << "After ABORT (注: 当前 DML 独立提交, ABORT 不回滚数据):" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM products WHERE pid = '999'");
+        engine.ExecuteQuery("BEGIN");
+        engine.ExecuteQuery("COMMIT");
 
         std::cout << "\n=== All Tests Complete ===" << std::endl;
         return 0;
