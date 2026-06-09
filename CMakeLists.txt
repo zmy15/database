@@ -1,4 +1,4 @@
-# CMakeList.txt: database 的 CMake 项目，在此处包括源代码并定义
+﻿# CMakeList.txt: database 的 CMake 项目，在此处包括源代码并定义
 # 项目特定的逻辑。
 #
 cmake_minimum_required (VERSION 3.10)
@@ -78,6 +78,8 @@ add_executable(index_test
     "src/storage/file_disk_manager.cpp"
     "src/buffer/lru_replacer.cpp"
     "src/buffer/buffer_pool_manager.cpp"
+    "src/concurrency/lock_manager.cpp"
+    "src/concurrency/transaction.cpp"
 )
 target_include_directories(index_test PRIVATE include)
 target_link_libraries(index_test PRIVATE gtest_main)
@@ -94,6 +96,8 @@ add_executable(table_page_test
     "src/storage/file_disk_manager.cpp"
     "src/buffer/lru_replacer.cpp"
     "src/buffer/buffer_pool_manager.cpp"
+    "src/concurrency/lock_manager.cpp"
+    "src/concurrency/transaction.cpp"
 )
 target_include_directories(table_page_test PRIVATE include)
 target_link_libraries(table_page_test PRIVATE gtest_main)
@@ -106,6 +110,8 @@ add_executable(table_heap_test
     "src/storage/file_disk_manager.cpp"
     "src/buffer/lru_replacer.cpp"
     "src/buffer/buffer_pool_manager.cpp"
+    "src/concurrency/lock_manager.cpp"
+    "src/concurrency/transaction.cpp"
 )
 target_include_directories(table_heap_test PRIVATE include)
 target_link_libraries(table_heap_test PRIVATE gtest_main)

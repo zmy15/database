@@ -33,7 +33,8 @@ DBEngine::DBEngine(const std::string& db_file, size_t buffer_pool_size) {
         table_schemas_, indexes_, tables_,
         buffer_pool_manager_.get(),
         /*txn=*/nullptr,
-        lock_manager_.get());
+        lock_manager_.get(),
+        txn_manager_.get());
 
     // 7. 崩溃恢复：REDO 已提交事务
     DoRecovery();
@@ -45,6 +46,7 @@ DBEngine::~DBEngine() {
     indexes_.clear();
     if (log_manager_) {
         log_manager_->FlushLogs();
+        log_manager_->TruncateAll();  // 正常关闭：所有脏页已刷盘，WAL 可安全清空
     }
     if (buffer_pool_manager_) {
         buffer_pool_manager_->Destroy();
@@ -118,6 +120,12 @@ void DBEngine::DoRecovery() {
         Page* page = buffer_pool_manager_->FetchPage(rec.page_id);
         if (!page) continue;
 
+        // REDO 幂等性保护：如果页面 LSN 已经 >= 日志 LSN，说明该操作已落盘，跳过
+        if (page->GetLSN() >= rec.lsn) {
+            buffer_pool_manager_->UnpinPage(rec.page_id, false);
+            continue;
+        }
+
         auto* tp = reinterpret_cast<TablePage*>(page);
 
         switch (rec.op_type) {
@@ -141,12 +149,23 @@ void DBEngine::DoRecovery() {
             break;
         }
 
+        // REDO 完成后更新页面 LSN，防止后续恢复重复应用
+        page->SetLSN(rec.lsn);
         buffer_pool_manager_->UnpinPage(rec.page_id, true);
     }
 
     // 5. UNDO：对每个中止的事务调用 ApplyUndoForTransaction
     for (txn_id_t tid : aborted_txns) {
         ApplyUndoForTransaction(tid);
+    }
+
+    // 5.5 将恢复识别出的已提交/已中止事务注册到 TransactionManager（MVCC 可见性判断用）
+    // 崩溃前运行的事务无 TransactionManager 记录，需手动注入，使 IsVisible() 能正确判断
+    for (txn_id_t tid : committed_txns) {
+        txn_manager_->MarkCommitted(tid);
+    }
+    for (txn_id_t tid : aborted_txns) {
+        txn_manager_->MarkAborted(tid);
     }
 
     // 6. 将恢复后的所有脏页刷盘
@@ -163,6 +182,9 @@ void DBEngine::DoRecovery() {
 }
 
 void DBEngine::ApplyUndoForTransaction(txn_id_t txn_id) {
+    // ⚠️ 此方法仅供崩溃恢复（DoRecovery）使用。
+    // 正常运行时的 Abort 已改为 MVCC 模式：仅标记事务 ABORTED，
+    // 其 xmin/xmax 在 IsVisible() 中自动失效，无需物理回滚页面。
     // 1. 读取 WAL 中所有日志记录
     auto records = log_manager_->ReadLogRecords();
 
@@ -198,7 +220,7 @@ void DBEngine::ApplyUndoForTransaction(txn_id_t txn_id) {
                 if (idx_it != indexes_.end() && rec.new_tuple.GetSize() > 0) {
                     const auto& vals = rec.new_tuple.GetValues();
                     if (!vals.empty()) {
-                        idx_it->second->Remove(vals[0]);
+                        idx_it->second->Remove(vals[0], txn_id, txn_manager_.get(), IsolationLevel::READ_COMMITTED);
                     }
                 }
             }
@@ -329,7 +351,7 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
             if (idx_it != indexes_.end()) {
                 const auto& vals = ins.tuple.GetValues();
                 if (!vals.empty()) {
-                    idx_it->second->Insert(vals[0], ins.tuple, 0);
+                    idx_it->second->Insert(vals[0], ins.tuple, txn->GetTransactionId(), txn_manager_.get());
                 }
             }
             std::cout << "[OK] Inserted 1 row into '" << ins.table_name << "'." << std::endl;
@@ -561,7 +583,7 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
                 if (idx_it_upd != indexes_.end()) {
                     const auto& old_vals = entry.old_tuple.GetValues();
                     if (!old_vals.empty()) {
-                        idx_it_upd->second->Remove(old_vals[0]);
+                        idx_it_upd->second->Remove(old_vals[0], txn->GetTransactionId(), txn_manager_.get(), txn->GetIsolationLevel());
                     }
                 }
 
@@ -585,7 +607,7 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
                     if (idx_it_upd != indexes_.end()) {
                         const auto& new_vals = entry.new_tuple.GetValues();
                         if (!new_vals.empty()) {
-                            idx_it_upd->second->Insert(new_vals[0], entry.new_tuple, 0);
+                            idx_it_upd->second->Insert(new_vals[0], entry.new_tuple, txn->GetTransactionId(), txn_manager_.get());
                         }
                     }
                 } else {
@@ -593,7 +615,7 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
                     if (idx_it_upd != indexes_.end()) {
                         const auto& old_vals = entry.old_tuple.GetValues();
                         if (!old_vals.empty()) {
-                            idx_it_upd->second->Insert(old_vals[0], entry.old_tuple, 0);
+                            idx_it_upd->second->Insert(old_vals[0], entry.old_tuple, txn->GetTransactionId(), txn_manager_.get());
                         }
                     }
                 }
@@ -645,7 +667,7 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
                     if (idx_it_upd != indexes_.end()) {
                         const auto& new_vals = entry.new_tuple.GetValues();
                         if (!new_vals.empty()) {
-                            idx_it_upd->second->Insert(new_vals[0], entry.new_tuple, 0);
+                            idx_it_upd->second->Insert(new_vals[0], entry.new_tuple, txn->GetTransactionId(), txn_manager_.get());
                         }
                     }
                 }
@@ -691,11 +713,10 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
             break;
         }
         txn_id_t tid = current_txn_->GetTransactionId();
-        // 执行 UNDO 回滚（逆序补偿 DML 操作 + 恢复索引）
-        ApplyUndoForTransaction(tid);
+        // MVCC 模式：Abort 后 xmin/xmax 通过 IsAborted() 判断自动失效，无需物理回滚
         txn_manager_->Abort(current_txn_);
         current_txn_ = nullptr;
-        std::cout << "[OK] Transaction #" << tid << " aborted (rolled back)." << std::endl;
+        std::cout << "[OK] Transaction #" << tid << " aborted." << std::endl;
         break;
     }
     default:

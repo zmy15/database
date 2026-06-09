@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "execution/executor.h"
 #include "index/b_plus_tree.h"
@@ -24,10 +24,12 @@ public:
                       TableHeap* table_heap, BufferPoolManager* bpm,
                       Transaction* txn = nullptr,
                       LockManager* lock_mgr = nullptr,
-                      const std::string& table_name = "")
+                     const std::string& table_name = "",
+                     TransactionManager* txn_mgr = nullptr)
         : bptree_(bptree), key_(key),
           table_heap_(table_heap), bpm_(bpm),
-          txn_(txn), lock_mgr_(lock_mgr), table_name_(table_name) {}
+         txn_(txn), lock_mgr_(lock_mgr), table_name_(table_name),
+         txn_mgr_(txn_mgr) {}
 
     void Init() override;
     bool Next(Tuple* tuple) override;
@@ -40,7 +42,7 @@ private:
     Transaction* txn_;             // 当前事务（用于锁获取与 txn_id 传递）
     LockManager* lock_mgr_;        // 锁管理器（用于 Init 时获取共享锁）
     std::string table_name_;       // 表名（锁粒度标识）
-
+   TransactionManager* txn_mgr_{nullptr}; // 事务管理器（用于 MVCC 可见性判断）
     std::optional<Tuple> result_tuple_;  // 点查结果缓存
     bool returned_{false};               // 是否已返回结果
 };

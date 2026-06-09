@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "execution/executor.h"
 #include "execution/sql_parser.h"
@@ -33,13 +33,15 @@ public:
             const std::unordered_map<std::string, std::unique_ptr<TableHeap>>& tables,
             BufferPoolManager* bpm,
             Transaction* txn = nullptr,
-            LockManager* lock_mgr = nullptr)
+           LockManager* lock_mgr = nullptr,
+           TransactionManager* txn_mgr = nullptr)
         : table_schemas_(table_schemas),
           indexes_(indexes),
           tables_(tables),
           bpm_(bpm),
           txn_(txn),
-          lock_mgr_(lock_mgr) {}
+         lock_mgr_(lock_mgr),
+         txn_mgr_(txn_mgr) {}
 
     /**
      * @brief 为 SELECT 语句创建执行器树
@@ -55,6 +57,7 @@ private:
     BufferPoolManager* bpm_;
     Transaction* txn_;
     LockManager* lock_mgr_;
+   TransactionManager* txn_mgr_{nullptr};
 };
 
 } // namespace db

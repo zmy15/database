@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "storage/log_manager.h"
 #include "storage/disk_manager.h"
@@ -36,6 +36,8 @@ public:
     // 截断 WAL 文件到指定 LSN 之后（恢复完成后清理）
     void TruncateAfter(lsn_t target_lsn) override;
 
+    // 完全清空 WAL 文件（正常关闭时调用）
+    void TruncateAll() override;
 private:
     // 将一条 LogRecord 序列化写入文件缓冲区
     void WriteRecordToFile(const LogRecord& record);

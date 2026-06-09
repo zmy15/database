@@ -1,5 +1,7 @@
 #include "index/b_plus_tree.h"
 #include "index/b_plus_tree_page.h"
+#include "concurrency/lock_manager.h"
+#include "concurrency/transaction.h"
 #include <iostream>
 #include <stack>
 
@@ -37,21 +39,22 @@ static page_id_t FindChildInNode(BPlusTreePage* node, const std::string& key) {
 // 点查：GetValue
 // ============================================================
 
-std::optional<Tuple> BPlusTree::GetValue(const std::string& key, txn_id_t txn_id) {
-    (void)txn_id; // 当前简化实现不使用事务 ID
+std::optional<Tuple> BPlusTree::GetValue(const std::string& key, txn_id_t txn_id,
+                                          TransactionManager* txn_mgr,
+                                          IsolationLevel iso_level) {
 
     if (root_page_id_ == INVALID_PAGE_ID) {
         return std::nullopt;
     }
 
-    root_latch_.lock();
+    root_latch_.lock_shared();
     page_id_t page_id = root_page_id_;
 
     // 从根向下遍历到叶子
     while (true) {
         Page* page = bpm_->FetchPage(page_id);
         if (!page) {
-            root_latch_.unlock();
+            root_latch_.unlock_shared();
             return std::nullopt;
         }
         auto* node = reinterpret_cast<BPlusTreePage*>(page);
@@ -60,7 +63,20 @@ std::optional<Tuple> BPlusTree::GetValue(const std::string& key, txn_id_t txn_id
             int idx = node->FindKey(key);
             std::optional<Tuple> result;
             if (idx >= 0) {
-                result = node->GetValue(idx);
+                // 向前扫描到第一个同 key 的槽位（处理重复 key 的情况）
+                int first = idx;
+                while (first > 0 && node->GetKey(first - 1) == key) {
+                    --first;
+                }
+                // 向后扫描直到 key 不匹配或找到第一个可见的
+                uint32_t slot_count = node->GetSlotCount();
+                for (int i = first; i < static_cast<int>(slot_count); ++i) {
+                    if (node->GetKey(i) != key) break;
+                    if (node->IsSlotVisible(i, txn_id, txn_mgr, iso_level)) {
+                        result = node->GetValue(i);
+                        break;
+                    }
+                }
             }
             bpm_->UnpinPage(page_id, false);
             root_latch_.unlock_shared();
@@ -78,7 +94,9 @@ std::optional<Tuple> BPlusTree::GetValue(const std::string& key, txn_id_t txn_id
 // 删除：Remove
 // ============================================================
 
-bool BPlusTree::Remove(const std::string& key) {
+bool BPlusTree::Remove(const std::string& key, txn_id_t txn_id,
+                       TransactionManager* txn_mgr,
+                       IsolationLevel iso_level) {
     if (root_page_id_ == INVALID_PAGE_ID) {
         return false;
     }
@@ -105,8 +123,24 @@ bool BPlusTree::Remove(const std::string& key) {
             int idx = node->FindKey(key);
             bool removed = false;
             if (idx >= 0) {
-                node->MarkSlotDeleted(idx);
-                removed = true;
+                // 向前扫描到第一个同 key 的槽位（处理重复 key 的情况）
+                int first = idx;
+                while (first > 0 && node->GetKey(first - 1) == key) {
+                    --first;
+                }
+                // 向后扫描找第一个可见且未删除的槽位
+                uint32_t slot_count = node->GetSlotCount();
+                for (int i = first; i < static_cast<int>(slot_count); ++i) {
+                    if (node->GetKey(i) != key) break;
+                    if (node->IsSlotVisible(i, txn_id, txn_mgr, iso_level)) {
+                        // 检查是否已被删除（xmax != 0 则跳过）
+                        if (node->GetSlotXmax(i) == 0) {
+                            node->SetSlotXmax(i, txn_id);  // 写 xmax 替代物理删除
+                            removed = true;
+                        }
+                        break;  // 只删除第一个可见的匹配项
+                    }
+                }
             }
             bpm_->UnpinPage(page_id, removed);
             while (!path.empty()) {
@@ -128,12 +162,22 @@ bool BPlusTree::Remove(const std::string& key) {
 // 插入：Insert
 // ============================================================
 
-bool BPlusTree::Insert(const std::string& key, const Tuple& value, txn_id_t txn_id) {
-    (void)txn_id;
+bool BPlusTree::Insert(const std::string& key, const Tuple& value, txn_id_t txn_id,
+                       TransactionManager* txn_mgr) {
+    (void)txn_mgr;  // 保留供未来扩展（如唯一约束检查）
 
+    // 创建可变副本并设置 MVCC 版本字段
+    Tuple mvcc_value = value;
+   // 若 Tuple 已携带 MVCC 字段（如崩溃恢复 UNDO 重放 WAL 中的 old_tuple），保留原值
+   if (mvcc_value.GetXmin() == 0) {
+       mvcc_value.SetXmin(txn_id);
+       mvcc_value.SetXmax(0);
+   }
+   // 否则保持原值（WAL 中已包含原始的 xmin/xmax）
+    // 空树：直接创建根节点
     // 空树：直接创建根节点
     if (root_page_id_ == INVALID_PAGE_ID) {
-        return InsertIntoEmptyTree(key, value);
+        return InsertIntoEmptyTree(key, mvcc_value);
     }
 
     root_latch_.lock();
@@ -158,7 +202,7 @@ bool BPlusTree::Insert(const std::string& key, const Tuple& value, txn_id_t txn_
 
         if (node->IsLeaf()) {
             // 到达叶子，委托给 InsertIntoLeaf 处理插入与分裂
-            return InsertIntoLeaf(page_id, node, key, value, path);
+            return InsertIntoLeaf(page_id, node, key, mvcc_value, path);
         }
 
         // 内部节点：继续向下
@@ -442,8 +486,9 @@ void BPlusTree::UpdateParentPointers(page_id_t page_id, BPlusTreePage* node) {
 
 std::vector<Tuple> BPlusTree::ScanRange(const std::string& start_key,
                                          const std::string& end_key,
-                                         txn_id_t txn_id) {
-    (void)txn_id;
+                                         txn_id_t txn_id,
+                                         TransactionManager* txn_mgr,
+                                         IsolationLevel iso_level) {
     std::vector<Tuple> results;
 
     if (root_page_id_ == INVALID_PAGE_ID) {
@@ -472,7 +517,7 @@ std::vector<Tuple> BPlusTree::ScanRange(const std::string& start_key,
 
                 uint32_t slot_count = leaf->GetSlotCount();
                 for (uint32_t i = 0; i < slot_count; ++i) {
-                    if (leaf->IsSlotDeleted(i)) continue;
+                    if (!leaf->IsSlotVisible(i, txn_id, txn_mgr, iso_level)) continue;
                     std::string key = leaf->GetKey(i);
                     // 在范围内的判断
                     if (key >= start_key && key <= end_key) {
@@ -482,7 +527,7 @@ std::vector<Tuple> BPlusTree::ScanRange(const std::string& start_key,
                     if (key > end_key) {
                         bpm_->UnpinPage(leaf_id, false);
                         bpm_->UnpinPage(page_id, false);
-                        root_latch_.unlock();
+                        root_latch_.unlock_shared();
                         return results;
                     }
                 }

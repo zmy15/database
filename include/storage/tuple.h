@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "common/config.h"
 #include "common/rid.h"
@@ -6,6 +6,10 @@
 #include <string>
 
 namespace db {
+
+// 前向声明（避免循环依赖）
+class TransactionManager;
+enum class IsolationLevel;
 
 /**
  * @brief 在真实的数据库中，Tuple 应该是无模式的二进制数据。
@@ -39,6 +43,21 @@ public:
     RID GetRID() const { return rid_; }
     void SetRID(RID rid) { rid_ = rid; }
 
+    // MVCC 版本字段（xmin=创建事务ID, xmax=删除事务ID, 0 表示系统/不存在）
+    txn_id_t GetXmin() const { return xmin_; }
+    void SetXmin(txn_id_t xmin) { xmin_ = xmin; }
+    txn_id_t GetXmax() const { return xmax_; }
+    void SetXmax(txn_id_t xmax) { xmax_ = xmax; }
+
+    // MVCC 可见性判断：检查 Tuple 对指定读事务是否可见
+    // @param reader_txn  读取事务的 ID
+    // @param txn_mgr     事务管理器（查询事务提交/中止状态）
+    // @param iso_level   隔离级别
+    static bool IsVisible(const Tuple& tuple, txn_id_t reader_txn,
+                          TransactionManager* txn_mgr, IsolationLevel iso_level);
+
+    txn_id_t xmin_{0}; // 创建该 Tuple 的事务 ID（MVCC）
+    txn_id_t xmax_{0}; // 删除该 Tuple 的事务 ID（MVCC，0=未删除）
 private:
     std::vector<std::string> values_;
     RID rid_;

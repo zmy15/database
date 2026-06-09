@@ -329,6 +329,18 @@ void FileLogManager::TruncateAfter(lsn_t target_lsn) {
     }
 }
 
+void FileLogManager::TruncateAll() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    FlushLogsInternal();
+    wal_file_.close();
+    // 以截断模式重新打开，清空文件内容
+    wal_file_.open(wal_file_path_, std::ios::binary | std::ios::out | std::ios::trunc);
+    wal_file_.close();
+    wal_file_.open(wal_file_path_, std::ios::binary | std::ios::in | std::ios::out | std::ios::app);
+    next_lsn_ = 0;
+    flushed_lsn_ = -1;
+}
+
 void FileLogManager::OpenWALFile() {
     wal_file_.open(wal_file_path_,
                    std::ios::binary | std::ios::in | std::ios::out | std::ios::app);

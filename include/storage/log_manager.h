@@ -46,6 +46,8 @@ public:
 
     // 截断 WAL 文件到指定 LSN 之后（恢复完成后清理）
     virtual void TruncateAfter(lsn_t target_lsn) = 0;
-};
 
+    // 完全清空 WAL 文件（正常关闭时调用，所有脏页已刷盘）
+    virtual void TruncateAll() = 0;
+};
 } // namespace db

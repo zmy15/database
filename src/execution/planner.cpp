@@ -1,4 +1,4 @@
-﻿#include "execution/planner.h"
+#include "execution/planner.h"
 #include "execution/seq_scan_executor.h"
 #include "execution/filter_executor.h"
 #include "execution/projection_executor.h"
@@ -49,7 +49,7 @@ std::unique_ptr<AbstractExecutor> Planner::CreatePlan(const SelectStmt* stmt) {
         // 索引等值点查
         auto idx_it = indexes_.find(stmt->table_name);
         executor = std::make_unique<IndexScanExecutor>(
-            idx_it->second.get(), index_key, heap, bpm_, txn_, lock_mgr_, stmt->table_name);
+           idx_it->second.get(), index_key, heap, bpm_, txn_, lock_mgr_, stmt->table_name, txn_mgr_);
     } else {
         // 全表顺序扫描
         executor = std::make_unique<SeqScanExecutor>(heap, bpm_, txn_, lock_mgr_, stmt->table_name);

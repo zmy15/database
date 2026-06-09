@@ -362,16 +362,18 @@ void TransactionManager::Commit(Transaction* txn) {
         lsn_t lsn = log_manager_->AppendLogRecord(record);
         txn->SetPrevLSN(lsn);
     }
-
     // 更新事务状态为已提交
     txn->SetState(TransactionState::COMMITTED);
 
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    // 释放事务持有的所有锁（进入缩减阶段）
+    // 释放事务持有的所有锁（在标记 COMMITTED 之后，确保崩溃恢复可判定事务已提交）
     lock_manager_->UnlockAll(txn);
 
-    // 从事务表中移除
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // 记录已提交事务 ID（MVCC 可见性判断用）
+    committed_txns_.insert(txn->GetTransactionId());
+
+    // 从活跃事务表中移除（committed_txns_ 已保留其 ID 供 MVCC 可见性查询）
     txn_map_.erase(txn->GetTransactionId());
 }
     
@@ -382,6 +384,30 @@ Transaction* TransactionManager::GetTransaction(txn_id_t txn_id) {
         return it->second.get();
     }
     return nullptr;
+}
+
+// ============================================================
+// MVCC 可见性查询：IsCommitted / IsAborted
+// ============================================================
+
+bool TransactionManager::IsCommitted(txn_id_t txn_id) const {
+    // 优先查 committed_txns_ 集合（O(1)）
+    if (committed_txns_.count(txn_id) > 0) return true;
+    // 回退到 txn_map_ 检查状态（处理系统恢复后仍未清理的事务）
+    auto it = txn_map_.find(txn_id);
+    if (it != txn_map_.end() && it->second->GetState() == TransactionState::COMMITTED) {
+        return true;
+    }
+    return false;
+}
+
+bool TransactionManager::IsAborted(txn_id_t txn_id) const {
+    if (aborted_txns_.count(txn_id) > 0) return true;
+    auto it = txn_map_.find(txn_id);
+    if (it != txn_map_.end() && it->second->GetState() == TransactionState::ABORTED) {
+        return true;
+    }
+    return false;
 }
 
 void TransactionManager::Abort(Transaction* txn) {
@@ -402,12 +428,15 @@ void TransactionManager::Abort(Transaction* txn) {
         txn->SetPrevLSN(lsn);
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-
-    // 回滚时同样需要释放所有锁
+    // 释放事务持有的所有锁（MVCC 模式下 Abort 无需物理回滚，但必须释放锁）
     lock_manager_->UnlockAll(txn);
 
-    // 从事务表中移除
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    // 记录已中止事务 ID（MVCC 可见性判断用）
+    aborted_txns_.insert(txn->GetTransactionId());
+
+    // 从活跃事务表中移除（aborted_txns_ 已保留其 ID 供 MVCC 可见性查询）
     txn_map_.erase(txn->GetTransactionId());
 }
 

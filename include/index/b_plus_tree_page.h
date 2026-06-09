@@ -40,6 +40,17 @@ public:
     // 标记删除（将槽位 size 设为 0）
     void MarkSlotDeleted(uint32_t slot_idx);
     bool IsSlotDeleted(uint32_t slot_idx);
+
+    // ========== MVCC 可见性感知操作（替代旧式 size=0 删除标记）==========
+    // 原地覆写 Tuple 序列化数据中的 xmax 字段（不重新序列化整个 Tuple）
+    void SetSlotXmax(uint32_t slot_idx, txn_id_t xmax);
+    // 读取槽位中 Tuple 的 xmin / xmax
+    txn_id_t GetSlotXmin(uint32_t slot_idx);
+    txn_id_t GetSlotXmax(uint32_t slot_idx);
+    // 判断槽位对指定读事务是否可见（内部节点始终为 true，叶子节点基于 MVCC 规则）
+    bool IsSlotVisible(uint32_t slot_idx, txn_id_t reader_txn,
+                       TransactionManager* txn_mgr, IsolationLevel iso_level);
+
     // 物理移除槽位（压缩槽位数组，释放一个槽位空间）
     bool RemoveSlot(uint32_t slot_idx);
     // 获取活跃（非删除）槽位数

@@ -11,10 +11,11 @@
      returned_ = false;
      result_tuple_ = std::nullopt;
  
-     if (bptree_ != nullptr) {
-         txn_id_t tid = (txn_ != nullptr) ? txn_->GetTransactionId() : 0;
-         result_tuple_ = bptree_->GetValue(key_, tid);
-     }
+    if (bptree_ != nullptr) {
+        txn_id_t tid = (txn_ != nullptr) ? txn_->GetTransactionId() : 0;
+       IsolationLevel iso = (txn_ != nullptr) ? txn_->GetIsolationLevel() : IsolationLevel::READ_COMMITTED;
+       result_tuple_ = bptree_->GetValue(key_, tid, txn_mgr_, iso);
+    }
  }
  
  bool IndexScanExecutor::Next(Tuple* tuple) {

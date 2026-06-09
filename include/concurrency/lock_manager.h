@@ -84,6 +84,17 @@ public:
     // 通过事务 ID 获取事务对象（供死锁检测使用）
     Transaction* GetTransaction(txn_id_t txn_id);
 
+    // MVCC 可见性查询：检查事务是否已提交/已中止
+    bool IsCommitted(txn_id_t txn_id) const;
+    bool IsAborted(txn_id_t txn_id) const;
+
+    // 崩溃恢复时注册已提交/已中止事务（供 MVCC 可见性判断）
+    void MarkCommitted(txn_id_t txn_id) { committed_txns_.insert(txn_id); }
+    void MarkAborted(txn_id_t txn_id) { aborted_txns_.insert(txn_id); }
+
+    // 已提交/已中止事务 ID 集合（MVCC 可见性判断用，Commit/Abort 后保留供查询）
+    std::unordered_set<txn_id_t> committed_txns_;
+    std::unordered_set<txn_id_t> aborted_txns_;
 private:
     LockManager* lock_manager_;
     LogManager* log_manager_;

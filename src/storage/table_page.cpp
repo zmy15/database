@@ -41,8 +41,10 @@ bool TablePage::InsertTuple(const Tuple& tuple, RID* rid) {
     // 4. 更新页面配置
     SetTupleCount(slot_num + 1);
 
-    // 5. 设置返回的 RID
-    rid->Set(GetTablePageId(), slot_num);
+    // 5. 设置返回的 RID（调用者传 nullptr 表示不需要 RID，需防御）
+    if (rid) {
+        rid->Set(GetTablePageId(), slot_num);
+    }
     return true;
 }
 

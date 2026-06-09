@@ -1,4 +1,6 @@
 ﻿#include "index/b_plus_tree_page.h"
+#include "concurrency/lock_manager.h"
+#include "concurrency/transaction.h"
 #include <algorithm>
 #include <cstring>
 
@@ -320,6 +322,51 @@ void BPlusTreePage::MarkSlotDeleted(uint32_t slot_idx) {
 
 bool BPlusTreePage::IsSlotDeleted(uint32_t slot_idx) {
     return GetSlotSize(slot_idx) == 0;
+}
+
+// ============================================================
+// MVCC 可见性感知操作
+// ============================================================
+
+void BPlusTreePage::SetSlotXmax(uint32_t slot_idx, txn_id_t xmax) {
+    // 仅在叶子节点有效（内部节点不存 Tuple）
+    if (!IsLeaf()) return;
+
+    uint32_t offset = GetSlotOffset(slot_idx);
+    char* src = GetData() + offset;
+
+    // 叶子节点数据格式: key_len(4) + key_data(var) + tuple_size(4) + tuple_data(var)
+    // tuple_data 格式: xmin(4) + xmax(4) + field_count(4) + ...
+    // 因此 xmax 在数据中的偏移 = 4(key_len) + key_len + 4(tuple_size) + 4(xmin)
+    uint32_t key_len = *reinterpret_cast<const uint32_t*>(src);
+    char* xmax_ptr = src + sizeof(uint32_t) + key_len + sizeof(uint32_t) + sizeof(txn_id_t);
+    std::memcpy(xmax_ptr, &xmax, sizeof(txn_id_t));
+}
+
+txn_id_t BPlusTreePage::GetSlotXmin(uint32_t slot_idx) {
+    Tuple val = GetValue(slot_idx);
+    return val.GetXmin();
+}
+
+// ============================================================
+txn_id_t BPlusTreePage::GetSlotXmax(uint32_t slot_idx) {
+    Tuple val = GetValue(slot_idx);
+    return val.GetXmax();
+}
+
+bool BPlusTreePage::IsSlotVisible(uint32_t slot_idx, txn_id_t reader_txn,
+                                   TransactionManager* txn_mgr, IsolationLevel iso_level) {
+    // 旧式删除检查（size==0 的槽位不可见，兼容历史数据）
+    if (IsSlotDeleted(slot_idx)) {
+        return false;
+    }
+    // 内部节点不存 Tuple，所有槽位均可见（结构性数据）
+    if (!IsLeaf()) {
+        return true;
+    }
+    // 叶子节点：反序列化 Tuple 并用 MVCC 规则判断可见性
+    Tuple val = GetValue(slot_idx);
+    return Tuple::IsVisible(val, reader_txn, txn_mgr, iso_level);
 }
 
 // ============================================================
