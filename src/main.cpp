@@ -150,7 +150,7 @@ int main() {
         std::cout << "Restored User_5 data." << std::endl;
 
         // ==========================================
-        // 测试 14: 事务控制 (BEGIN / COMMIT / ABORT)
+        // 测试 14: 事务控制 - 单语句回滚 (BEGIN / INSERT / ABORT)
         // ==========================================
         std::cout << "\n=== [Test 14] Transaction Control ===" << std::endl;
         engine.ExecuteQuery("BEGIN");
@@ -161,6 +161,43 @@ int main() {
         engine.ExecuteQuery("SELECT * FROM products WHERE pid = '999'");
         engine.ExecuteQuery("BEGIN");
         engine.ExecuteQuery("COMMIT");
+
+        // ==========================================
+        // 测试 14b: 多 DML 事务回滚 (INSERT + UPDATE 全部 ABORT)
+        // ==========================================
+        std::cout << "\n=== [Test 14b] Multi-DML Transaction Rollback (INSERT+UPDATE) ===" << std::endl;
+        std::cout << "--- Step 1: BEGIN + INSERT + UPDATE ---" << std::endl;
+        engine.ExecuteQuery("BEGIN");
+        engine.ExecuteQuery("INSERT INTO products VALUES ('777', 'RollbackTest', '777.77')");
+        engine.ExecuteQuery("UPDATE products SET price = '888.88' WHERE pid = '777'");
+        std::cout << "--- Step 2: SELECT within transaction (should see the data) ---" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM products WHERE pid = '777'");
+        std::cout << "--- Step 3: ABORT (rollback all changes) ---" << std::endl;
+        engine.ExecuteQuery("ABORT");
+        std::cout << "After ABORT (should return 0 rows):" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM products WHERE pid = '777'");
+
+        // ==========================================
+        // 测试 14c: 多 DML 事务回滚 (INSERT + DELETE 全部 ABORT)
+        // ==========================================
+        std::cout << "\n=== [Test 14c] Multi-DML Transaction Rollback (INSERT+DELETE) ===" << std::endl;
+        engine.ExecuteQuery("BEGIN");
+        engine.ExecuteQuery("INSERT INTO products VALUES ('666', 'DeleteTest', '666.66')");
+        engine.ExecuteQuery("DELETE FROM products WHERE pid = '666'");
+        std::cout << "After ABORT (data should NOT exist, DELETE was rolled back):" << std::endl;
+        engine.ExecuteQuery("ABORT");
+        engine.ExecuteQuery("SELECT * FROM products WHERE pid = '666'");
+
+        // ==========================================
+        // 测试 14d: auto-commit 不受影响（无 BEGIN 的 DML 照常提交）
+        // ==========================================
+        std::cout << "\n=== [Test 14d] Auto-commit DML (no BEGIN) ===" << std::endl;
+        engine.ExecuteQuery("INSERT INTO products VALUES ('555', 'AutoCommit', '555.55')");
+        std::cout << "After auto-commit INSERT (should find the row):" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM products WHERE pid = '555'");
+        engine.ExecuteQuery("DELETE FROM products WHERE pid = '555'");
+        std::cout << "After auto-commit DELETE (should return 0 rows):" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM products WHERE pid = '555'");
 
         // ==========================================
         // 测试 DROP TABLE
