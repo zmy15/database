@@ -145,7 +145,7 @@ SeqScanExecutor → FilterExecutor → ProjectionExecutor
 - 隔离级别：READ_COMMITTED / REPEATABLE_READ / SERIALIZABLE
 - 锁表：基于表名（string key）的锁条目，跟踪持有者；事务锁集合类型与锁表统一
 
-> ⚠️ 当前为单线程设计，锁管理器接口已就绪但尚未完全接入多线程环境。
+    > ⚠️ 锁管理器（含死锁检测）已实现，但缓冲池和 B+ 树仍使用全局大锁，尚未在多线程生产环境下验证。
 
 ## 🔧 构建与运行
 
@@ -193,8 +193,13 @@ ctest --preset x64-debug
 
 ## 📋 已知限制 (TODO)
 
-### 🔴 严重缺失
-- **隔离级别**：`IsolationLevel` 枚举定义了 `READ_COMMITTED`/`REPEATABLE_READ`/`SERIALIZABLE` 三种级别，但**所有代码路径行为完全相同**，无 MVCC、无快照隔离
+### ✅ 已修复 (v1.2) — 隔离级别区分
+- **隔离级别**：`READ_COMMITTED` / `REPEATABLE_READ` / `SERIALIZABLE` 三种级别已通过**锁策略分化**实现行为差异：
+  - `READ_COMMITTED`：读操作使用共享锁，语句结束后释放（允许不可重复读）
+  - `REPEATABLE_READ`：读操作使用共享锁，持有到事务提交（保证可重复读）
+  - `SERIALIZABLE`：所有操作使用排他锁，持有到提交（完全串行化，防止幻读）
+- **多语句事务**：新增 `BEGIN` / `COMMIT` / `ABORT` SQL 支持，`BEGIN` 可选 `ISOLATION LEVEL` 子句指定隔离级别
+- **事务状态跟踪**：`Transaction` 新增 `ACTIVE → COMMITTED/ABORTED` 生命周期状态，`TransactionManager::Begin()` 记录快照 LSN
 
 ### ✅ 已修复 (v1.1)
 - **编译错误**：~~`LockExclusiveInternal` 末尾重构残留导致编译失败~~ → ✅ 闭合大括号缩进已修正，与 `LockSharedInternal` 保持一致
@@ -206,21 +211,23 @@ ctest --preset x64-debug
 ### 🟡 功能缺失
 - **死锁检测**：已实现（BFS 环路检测 + 受害者选择 + 自动中止重试），并有 2 个单元测试覆盖，但尚未在多线程生产环境下验证，`BufferPoolManager` 和 B+树仍使用全局大锁
 - **崩溃恢复 (ARIES)**：基础 REDO/UNDO 恢复已实现（`DoRecovery()` 按 LSN 顺序 REDO 已提交事务、反向 UNDO 未提交事务），但缺少 ARIES 完整协议特性：检查点(Checkpoint)、CLR 补偿日志记录、分析阶段(Analysis Phase)
--- **SQL 特性缺失**：
-  - `JOIN` — 无 Join 算子，解析器仅支持单表 FROM
-  - `ORDER BY` — `SelectStmt` 中声明了字段但 SQL 解析器不解析
-  - `GROUP BY` — 同 ORDER BY，字段声明存在但解析器不设置（`AggregateExecutor` 内部已支持哈希分组逻辑）
-  - `DISTINCT` / `LIMIT` / `HAVING` — 完全未实现
-  - `DROP TABLE` — B+树 `Drop()` 方法已实现，但 SQL 解析器不支持该语句
-  - 子查询 / 嵌套查询 — 完全未实现
-- **类型系统**：所有列值以 `std::string` 存储，无 INT/FLOAT/DATE 等类型区分（WHERE 比较时尝试智能数值比较作为补偿）
+    - **SQL 特性缺失**：
+      - `JOIN` — 无 Join 算子，解析器仅支持单表 FROM
+      - `ORDER BY` — `SelectStmt` 中声明了字段但 SQL 解析器不解析，执行器侧也无排序算子
+      - `GROUP BY` — `SelectStmt` 中声明了字段但 SQL 解析器不设置（`AggregateExecutor` 内部已实现哈希分组逻辑，仅缺解析器侧连接）
+      - `DISTINCT` / `LIMIT` / `HAVING` — 完全未实现，代码库中无任何痕迹
+      - `DROP TABLE` — B+树 `Drop()` 和 `TableHeap::Drop()` 已实现，`BufferPoolManager` 也有回收接口，但 `SQLStmtType` 枚举和 `SQLParser::Parse()` 均不支持该语句
+      - 子查询 / 嵌套查询 — 完全未实现
+    - **查询优化器**：仅基于简单规则（单等值条件 → IndexScan，否则 SeqScan），无基于代价的优化器 (CBO)、无统计信息
 - **查询优化器**：仅基于简单规则（单等值条件 → IndexScan，否则 SeqScan），无基于代价的优化器 (CBO)
 - **预编译语句** (Prepared Statements)：完全未实现
 - **网络协议层**：无可远程访问的网络接口
 
 ### 🟢 待改进
 - **B+树空间回收**：`Remove()` 仅标记删除（size 置 0），节点不合并、垃圾不回收，树只增长不收缩
-- **磁盘页回收**：`FileDiskManager::DeallocatePage()` 仅将页面清零，未维护空闲页链表/位图
+    - **磁盘页回收**：`FileDiskManager::DeallocatePage()` 仅将页面清零，未维护空闲页链表/位图，已删除表的磁盘空间无法复用
+    - **占位源文件**：`src/concurrency/transaction.cpp` 仅含一个 `const char` 占位变量以满足 CMake 编译目标，所有实现在头文件内联，不符合 .h/.cpp 分离惯例
+    - **Copilot 指令**：`.github/copilot-instructions.md` 为流水账描述，非结构化项目指南
 - **CI/CD**：`.github/workflows/` 为空目录，无自动化构建/测试流水线
 - **遗留文件**：`test/storage/CMakeLists.txt` 已全部注释（测试定义已迁移到根 `CMakeLists.txt`），可清理
 

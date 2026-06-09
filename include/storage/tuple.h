@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "common/config.h"
 #include "common/rid.h"
@@ -14,6 +14,9 @@ namespace db {
  * 或将磁盘中读出的字节反序列化 (Deserialize) 为业务代码看得懂的结构。
  */
 class Tuple {
+    // 合并两个 Tuple 的值列表（用于 JOIN 输出）
+    static Tuple Merge(const Tuple& left, const Tuple& right);
+
 public:
     Tuple() = default;
 

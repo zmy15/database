@@ -1,4 +1,4 @@
-﻿#include "storage/tuple.h"
+#include "storage/tuple.h"
 #include <cstring>
 
 namespace db {
@@ -52,6 +52,16 @@ void Tuple::SerializeTo(char* storage) const {
         std::memcpy(storage + offset, val.data(), val_size);
         offset += val_size;
     }
+}
+
+Tuple Tuple::Merge(const Tuple& left, const Tuple& right) {
+    std::vector<std::string> merged;
+    const auto& left_vals = left.GetValues();
+    const auto& right_vals = right.GetValues();
+    merged.reserve(left_vals.size() + right_vals.size());
+    merged.insert(merged.end(), left_vals.begin(), left_vals.end());
+    merged.insert(merged.end(), right_vals.begin(), right_vals.end());
+    return Tuple(merged);
 }
 
 } // namespace db

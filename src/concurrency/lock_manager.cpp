@@ -17,6 +17,21 @@ bool TwoPLManager::LockExclusive(Transaction* txn, const std::string& record_id)
         return LockExclusiveInternal(txn, record_id, 0);
 }
 
+// ============================================================
+// 隔离级别感知的读锁方法
+// ============================================================
+
+bool TwoPLManager::LockSharedForRead(Transaction* txn, const std::string& record_id) {
+    // 读操作用共享锁：READ_COMMITTED 下由调用方在语句结束后释放，
+    // REPEATABLE_READ 下由调用方持有到事务提交
+    return LockSharedInternal(txn, record_id, 0);
+}
+
+bool TwoPLManager::LockExclusiveForRead(Transaction* txn, const std::string& record_id) {
+    // SERIALIZABLE：读操作也使用排他锁，完全串行化所有访问，防止幻读
+    return LockExclusiveInternal(txn, record_id, 0);
+}
+
 bool TwoPLManager::Unlock(Transaction* txn, const std::string& record_id) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
 
@@ -326,6 +341,8 @@ Transaction* TransactionManager::Begin(IsolationLevel iso_level) {
         record.prev_lsn = -1;
         lsn_t lsn = log_manager_->AppendLogRecord(record);
         raw->SetPrevLSN(lsn);
+        // 记录事务开始时的 WAL LSN（作为 REPEATABLE_READ 快照基准）
+        raw->SetBeginLSN(lsn);
     }
 
     return raw;
@@ -346,6 +363,9 @@ void TransactionManager::Commit(Transaction* txn) {
         txn->SetPrevLSN(lsn);
     }
 
+    // 更新事务状态为已提交
+    txn->SetState(TransactionState::COMMITTED);
+
     std::lock_guard<std::mutex> lock(mutex_);
 
     // 释放事务持有的所有锁（进入缩减阶段）
@@ -355,17 +375,20 @@ void TransactionManager::Commit(Transaction* txn) {
     txn_map_.erase(txn->GetTransactionId());
 }
     
-    Transaction* TransactionManager::GetTransaction(txn_id_t txn_id) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        auto it = txn_map_.find(txn_id);
-        if (it != txn_map_.end()) {
-            return it->second.get();
-        }
-        return nullptr;
+Transaction* TransactionManager::GetTransaction(txn_id_t txn_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = txn_map_.find(txn_id);
+    if (it != txn_map_.end()) {
+        return it->second.get();
     }
+    return nullptr;
+}
 
 void TransactionManager::Abort(Transaction* txn) {
     if (!txn) return;
+
+    // 更新事务状态为已中止
+    txn->SetState(TransactionState::ABORTED);
 
     // 写入 ABORT 日志记录（在释放锁之前）
     if (log_manager_) {

@@ -87,3 +87,64 @@ TEST_F(TransactionManagerTest, IsolationLevelStored) {
     EXPECT_EQ(txn1->GetIsolationLevel(), IsolationLevel::READ_COMMITTED);
     EXPECT_EQ(txn2->GetIsolationLevel(), IsolationLevel::SERIALIZABLE);
 }
+
+// ============================================================
+// 测试 6: 多语句事务生命周期 — BEGIN → 操作 → COMMIT 流程
+// ============================================================
+TEST_F(TransactionManagerTest, MultiStatementTransactionLifecycle) {
+    // 模拟多语句事务：开始事务 → 执行多条操作 → 提交
+    Transaction* txn = txn_mgr_->Begin(IsolationLevel::REPEATABLE_READ);
+    txn_id_t tid = txn->GetTransactionId();
+
+    // 事务初始状态为 ACTIVE
+    EXPECT_EQ(txn->GetState(), TransactionState::ACTIVE);
+    EXPECT_EQ(txn->GetIsolationLevel(), IsolationLevel::REPEATABLE_READ);
+
+    // 第一步操作：获取共享锁（模拟 SELECT）
+    EXPECT_TRUE(lock_mgr_->LockShared(txn, "table_users"));
+    EXPECT_EQ(txn->GetSharedLockSet().size(), 1);
+
+    // 第二步操作：获取另一个共享锁（模拟第二个 SELECT）
+    EXPECT_TRUE(lock_mgr_->LockShared(txn, "table_products"));
+    EXPECT_EQ(txn->GetSharedLockSet().size(), 2);
+
+    // 提交事务
+    txn_mgr_->Commit(txn);
+
+    // 提交后锁应被释放，事务状态变为 COMMITTED
+    EXPECT_EQ(txn->GetState(), TransactionState::COMMITTED);
+    EXPECT_EQ(txn->GetSharedLockSet().size(), 0);
+    EXPECT_EQ(txn->GetExclusiveLockSet().size(), 0);
+
+    // 验证锁已释放：新事务可以获取这些锁
+    Transaction* txn2 = txn_mgr_->Begin();
+    EXPECT_TRUE(lock_mgr_->LockExclusive(txn2, "table_users"));
+    txn_mgr_->Commit(txn2);
+}
+
+// ============================================================
+// 测试 7: 多语句事务 ABORT — 中止后释放所有锁
+// ============================================================
+TEST_F(TransactionManagerTest, AbortReleasesLocksAfterMultiStatement) {
+    Transaction* txn = txn_mgr_->Begin(IsolationLevel::READ_COMMITTED);
+
+    // 执行多条操作：获取共享锁和排他锁
+    EXPECT_TRUE(lock_mgr_->LockShared(txn, "table_1"));
+    EXPECT_TRUE(lock_mgr_->LockExclusive(txn, "table_2"));
+    EXPECT_EQ(txn->GetSharedLockSet().size(), 1);
+    EXPECT_EQ(txn->GetExclusiveLockSet().size(), 1);
+
+    // 中止事务
+    txn_mgr_->Abort(txn);
+
+    // 中止后锁应全部释放，状态变为 ABORTED
+    EXPECT_EQ(txn->GetState(), TransactionState::ABORTED);
+    EXPECT_EQ(txn->GetSharedLockSet().size(), 0);
+    EXPECT_EQ(txn->GetExclusiveLockSet().size(), 0);
+
+    // 验证锁已释放：其他事务可以获取
+    Transaction* txn2 = txn_mgr_->Begin();
+    EXPECT_TRUE(lock_mgr_->LockExclusive(txn2, "table_1"));
+    EXPECT_TRUE(lock_mgr_->LockExclusive(txn2, "table_2"));
+    txn_mgr_->Commit(txn2);
+}

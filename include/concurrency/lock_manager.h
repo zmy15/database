@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 
 #include "common/config.h"
 #include "concurrency/transaction.h"
@@ -22,6 +22,8 @@ public:
 
     virtual bool LockShared(Transaction* txn, const std::string& record_id) = 0;
     virtual bool LockExclusive(Transaction* txn, const std::string& record_id) = 0;
+    virtual bool LockSharedForRead(Transaction* txn, const std::string& record_id) = 0;
+    virtual bool LockExclusiveForRead(Transaction* txn, const std::string& record_id) = 0;
     virtual bool Unlock(Transaction* txn, const std::string& record_id) = 0;
     virtual bool UnlockAll(Transaction* txn) = 0;
     virtual void SetTransactionManager(TransactionManager* mgr) = 0;
@@ -37,6 +39,13 @@ public:
 
     bool LockShared(Transaction* txn, const std::string& record_id) override;
     bool LockExclusive(Transaction* txn, const std::string& record_id) override;
+
+    // 隔离级别感知的读锁方法
+    // LockSharedForRead: 读操作获取共享锁（READ_COMMITTED、REPEATABLE_READ 使用）
+    // LockExclusiveForRead: 读操作获取排他锁（SERIALIZABLE 使用，防止幻读）
+    bool LockSharedForRead(Transaction* txn, const std::string& record_id) override;
+    bool LockExclusiveForRead(Transaction* txn, const std::string& record_id) override;
+
     bool Unlock(Transaction* txn, const std::string& record_id) override;
     bool UnlockAll(Transaction* txn) override;
 
