@@ -1,244 +1,337 @@
-# 🗄️ Micro Database Engine — 微型关系数据库引擎
+﻿# 🗄️ Micro Database Engine — 微型关系数据库引擎
 
-一个使用 **C++20** 从零构建的微型关系数据库引擎，旨在深入理解数据库内核实现原理，涵盖存储引擎、缓冲池、B+ 树索引、SQL 解析执行、事务与并发控制等核心模块。
+[![Language](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
+[![License](https://img.shields.io/badge/License-GPL--3.0-green.svg)](LICENSE.txt)
+[![Build](https://img.shields.io/badge/Build-CMake-brightgreen.svg)](CMakeLists.txt)
+[![Tests](https://img.shields.io/badge/Tests-Google%20Test-orange.svg)](test/)
+
+> 🇨🇳 中文 &nbsp;|&nbsp; 🇬🇧 [English](README_EN.md)
+
+一个使用 **C++20** 从零构建的微型关系数据库引擎，完整实现了数据库内核的核心流水线：
+**存储引擎 → 缓冲池 (LRU) → B+ 树索引 → SQL 解析 (递归下降) → 查询执行 (火山模型) → WAL 崩溃恢复 → 事务并发控制 (2PL + 死锁检测)**。
+
+> ⚠️ **本项目仅供学习与研究使用，不适用于生产环境。**
+
+---
+
+## 📐 系统架构
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    SQL 查询输入                        │
+└─────────────────────┬───────────────────────────────┘
+                      ▼
+┌─────────────────────────────────────────────────────┐
+│              SQLParser（递归下降解析器）               │
+│   CREATE / INSERT / SELECT / DELETE / UPDATE / DROP TABLE  │
+│   WHERE (AND/OR/比较) / ORDER BY / GROUP BY / 聚合   │
+│   BEGIN / COMMIT / ABORT (事务控制)                   │
+└─────────────────────┬───────────────────────────────┘
+                      ▼
+┌─────────────────────────────────────────────────────┐
+│               Planner（执行计划构建器）                │
+│   根据可用索引选择：IndexScan 或 SeqScan+Filter        │
+└─────────────────────┬───────────────────────────────┘
+                      ▼
+┌─────────────────────────────────────────────────────┐
+│            火山模型执行器 (Volcano Model)              │
+│  SeqScan → Filter → Projection → Aggregation         │
+│  IndexScan（B+ 树点查/范围扫描）                       │
+└─────────────────────┬───────────────────────────────┘
+                      ▼
+┌─────────────────────────────────────────────────────┐
+│           BufferPoolManager（缓冲池 + LRU）           │
+│         内存中缓存 4KB 页面，淘汰冷页到磁盘             │
+└──────────┬────────────────────┬─────────────────────┘
+           ▼                    ▼
+┌──────────────────┐  ┌──────────────────┐
+│   DiskManager    │  │   LogManager     │
+│  (文件磁盘读写)    │  │  (WAL 日志管理)   │
+└──────────────────┘  └──────────────────┘
+```
+
+---
+
+## ✨ 核心特性
+
+### 1. SQL 解析器（递归下降）
+
+- **DDL**: `CREATE TABLE table_name (col1, col2, ...)` / `DROP TABLE table_name`
+- **DML**: `INSERT INTO ... VALUES (...)` / `SELECT ... FROM ... WHERE ...` / `DELETE FROM ...` / `UPDATE ... SET ...`
+- **WHERE 子句**: 支持 `AND` / `OR`、比较运算符 (`=` `<>` `>` `<` `>=` `<=`)、括号嵌套
+- **ORDER BY**: 支持 `ASC`（默认）和 `DESC` 排序
+- **GROUP BY**: 分组聚合
+- **聚合函数**: `COUNT(*)` `COUNT(col)` `SUM` `AVG` `MIN` `MAX`
+- **事务控制**: `BEGIN` / `COMMIT` / `ABORT`（等价于 `ROLLBACK`）
+
+### 2. 存储引擎
+
+| 组件 | 文件 | 说明 |
+|------|------|------|
+| **DiskManager** | `include/storage/disk_manager.h` | 抽象磁盘接口：ReadPage / WritePage / AllocatePage / DeallocatePage |
+| **FileDiskManager** | `src/storage/file_disk_manager.cpp` | 基于本地文件的磁盘实现 |
+| **TablePage** | `include/storage/table_page.h` | 槽式页面布局（slotted page），支持 Insert / MarkDelete / Update / 遍历 |
+| **TableHeap** | `include/storage/table_heap.h` | 表堆 = 双向链表串联多个 TablePage，提供迭代器 |
+| **Tuple** | `include/storage/tuple.h` | 元组序列化/反序列化，支持变长字符串字段 |
+
+- 页面大小：**4KB** (`PAGE_SIZE = 4096`)
+- 表堆使用双向链表串联多个页面，支持高效追加写入
+
+### 3. 缓冲池 (Buffer Pool)
+
+| 组件 | 文件 | 说明 |
+|------|------|------|
+| **BufferPoolManager** | `include/buffer/buffer_pool_manager.h` | 页表映射 (page_id → frame_id) + FetchPage / NewPage / UnpinPage / FlushPage |
+| **LRUReplacer** | `include/buffer/lru_replacer.h` | LRU 淘汰策略，冷页写回磁盘 |
+| **Page** | `include/buffer/page.h` | 4KB 内存页，携带 pin_count / is_dirty / page_id 元数据 |
+
+- WAL 先行刷盘：`FlushPage` 前先调用 `LogManager::FlushLogs()` 确保 WAL 持久化
+- 线程安全：内部使用 `std::mutex` 保护
+
+### 4. B+ 树索引
+
+| 组件 | 文件 | 说明 |
+|------|------|------|
+| **BPlusTree** | `include/index/b_plus_tree.h` | 插入 / 点查 / 范围扫描 / 删除 / Drop（递归回收） |
+| **BPlusTreePage** | `include/index/b_plus_tree_page.h` | B+ 树页面布局（内部节点存 key + child，叶子节点双向链表） |
+
+- 内部节点：N 个 key 对应 N+1 个子节点，`prev_page_id` 存储 child[0]
+- 叶子节点：双向链表连接，支持高效范围扫描（`ScanRange`）
+- 根节点读写锁（`std::shared_mutex`）保护并发访问
+- 默认对表的第一列自动建立索引
+
+### 5. 查询执行（火山模型）
+
+```
+AbstractExecutor (基类)
+  ├── SeqScanExecutor      全表顺序扫描
+  ├── FilterExecutor       WHERE 条件过滤（包装子执行器）
+  ├── ProjectionExecutor   SELECT 列投影 + ORDER BY 排序
+  ├── AggregationExecutor  聚合计算 (COUNT/SUM/AVG/MIN/MAX) + GROUP BY
+  └── IndexScanExecutor    B+ 树索引扫描（点查 + 范围扫描）
+```
+
+- **Planner** 根据 WHERE 条件中的列是否命中索引自动选择 IndexScan 或 SeqScan+Filter
+- 火山模型：每个执行器实现 `Init()` + `Next(Tuple*)` 接口，按需拉取数据
+
+### 6. 事务与并发控制
+
+| 组件 | 文件 | 说明 |
+|------|------|------|
+| **Transaction** | `include/concurrency/transaction.h` | 事务上下文：txn_id / 隔离级别 / 状态 / LSN 链 / 锁集合 |
+| **TwoPLManager** | `include/concurrency/lock_manager.h` | 两阶段锁协议：共享锁 / 排他锁 / 等待图死锁检测 |
+| **TransactionManager** | `include/concurrency/lock_manager.h` | 事务生命周期：Begin / Commit / Abort |
+
+**隔离级别：**
+
+| 级别 | 读锁策略 | 特点 |
+|------|----------|------|
+| `READ_COMMITTED` | 共享锁，语句结束后释放 | 允许不可重复读 |
+| `REPEATABLE_READ` | 共享锁，持有到事务提交 | 保证可重复读 |
+| `SERIALIZABLE` | 排他锁 | 完全串行化，防止幻读 |
+
+**死锁检测：**
+- 使用等待图 (waits-for graph) 建模
+- DFS 检测环路，选中最年轻事务作为 victim 并 Abort
+
+### 7. WAL 崩溃恢复
+
+- **ARIES 风格**的 REDO / UNDO 协议
+- `DBEngine` 启动时自动执行 `DoRecovery()`：
+  1. 从 `.wal` 文件读取所有日志记录
+  2. 构建事务状态表（已提交 / 已中止）
+  3. **REDO**：按 LSN 顺序重放已提交事务的 INSERT/DELETE/UPDATE
+  4. **UNDO**：反向遍历回滚未提交事务的修改
+  5. 刷盘所有脏页，截断 WAL
+
+---
+
+## 🚀 快速开始
+
+### 环境要求
+
+- **C++20** 编译器（MSVC 2022+ / GCC 12+ / Clang 16+）
+- **CMake** ≥ 3.10
+- **Ninja**（Windows 推荐）或 Make
+
+### 构建
+
+```bash
+# 配置（使用 x64 Debug 预设）
+cmake --preset x64-debug
+
+# 编译
+cmake --build out/build/x64-debug
+```
+
+或手动配置：
+
+```bash
+mkdir build && cd build
+cmake .. -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build .
+```
+
+### 运行
+
+```bash
+./out/build/x64-debug/database
+```
+
+程序将自动执行一系列内置测试（CREATE TABLE / INSERT / SELECT / WHERE / DELETE / UPDATE / 事务 / 聚合 / GROUP BY / ORDER BY 等）。
+
+### 运行单元测试
+
+```bash
+# 构建测试目标
+cmake --build out/build/x64-debug --target concurrency_test
+cmake --build out/build/x64-debug --target index_test
+cmake --build out/build/x64-debug --target table_page_test
+cmake --build out/build/x64-debug --target table_heap_test
+
+# 运行
+ctest --test-dir out/build/x64-debug
+```
+
+---
 
 ## 📁 项目结构
 
 ```
 database/
-├── CMakeLists.txt                    # CMake 构建配置
-├── CMakePresets.json                 # 构建预设 (x64/x86, debug/release)
-├── LICENSE.txt                       # GPL-3.0 许可证
-├── README.md
-├── include/                          # 头文件（以 header-only 为主）
-│   ├── db_engine.h                   # 引擎入口 - DBEngine 类
-│   ├── buffer/                       # 缓冲池模块
-│   │   ├── buffer_pool_manager.h     # 缓冲池管理器 (LRU 淘汰)
-│   │   ├── lru_replacer.h            # LRU 页面置换策略
-│   │   └── page.h                    # 内存页 (4KB, pin_count, dirty, 读写锁)
-│   ├── common/                       # 公共定义
-│   │   ├── config.h                  # 类型别名: page_id_t, txn_id_t, lsn_t; PAGE_SIZE=4096
-│   │   └── rid.h                     # 记录标识符 RID (page_id + slot_num)
-│   ├── concurrency/                  # 并发控制
-│   │   ├── lock_manager.h            # 两阶段锁 (2PL) 管理器
-│   │   └── transaction.h             # 事务上下文 (隔离级别, 锁集合)
-│   ├── execution/                    # SQL 执行引擎
-│   │   ├── sql_parser.h              # SQL 解析器 (递归下降)
-│   │   ├── expression.h              # 比较/逻辑表达式
-│   │   ├── planner.h                 # 执行计划生成器 (选择 IndexScan 或 SeqScan)
-│   │   ├── executor.h                # 执行器基类 (火山模型: Init → Next)
-│   │   ├── seq_scan_executor.h       # 全表扫描
-│   │   ├── index_scan_executor.h     # 索引扫描
-│   │   ├── filter_executor.h         # WHERE 过滤
-│   │   ├── projection_executor.h     # 列投影
-│   │   └── aggregation_executor.h    # 聚合计算 (COUNT/SUM/AVG/MIN/MAX + GROUP BY)
-│   ├── index/                        # 索引模块
-│   │   ├── b_plus_tree.h             # B+ 树 (插入/查询/范围扫描/删除/回收)
-│   │   └── b_plus_tree_page.h        # B+ 树页面格式 (内部节点 & 叶子节点)
-│   └── storage/                      # 存储层
-│       ├── disk_manager.h            # 抽象磁盘 I/O 接口
-│       ├── file_disk_manager.h       # 文件磁盘管理器实现
-│       ├── log_manager.h             # WAL 日志管理器接口
-│       ├── file_log_manager.h        # 文件 WAL 日志管理器实现
-│       ├── table_heap.h              # 表堆 (TablePage 链表)
-│       ├── table_page.h              # 槽式页面布局 (slotted-page)
-│       ├── table_iterator.h          # 表扫描迭代器
-│       └── tuple.h                   # 元组 (行数据序列化/反序列化)
-├── src/                              # 实现文件 (.cpp)
-│   ├── main.cpp                      # 演示/测试入口
-│   ├── db_engine.cpp                 # DBEngine: 初始化, 恢复, ExecuteQuery 分发
-│   ├── buffer/                       # 缓冲池实现
-│   ├── concurrency/                  # 并发控制实现
-│   ├── execution/                    # 执行器实现
-│   ├── index/                        # B+ 树实现
-│   └── storage/                      # 存储层实现
-└── test/                             # 单元测试 (Google Test)
-    ├── storage/                      # 表页面 & 表堆测试
-    ├── index/                        # B+ 树索引测试
-    └── concurrency/                  # 锁管理器 & 事务管理器测试
+├── include/                     # 头文件
+│   ├── db_engine.h              # 数据库引擎入口
+│   ├── common/
+│   │   ├── config.h             # 类型定义（page_id_t, txn_id_t, PAGE_SIZE 等）
+│   │   └── rid.h                # 记录标识 (RID)
+│   ├── storage/
+│   │   ├── disk_manager.h       # 磁盘管理器接口
+│   │   ├── file_disk_manager.h  # 文件磁盘管理器实现
+│   │   ├── log_manager.h        # WAL 日志管理器接口 + LogRecord
+│   │   ├── file_log_manager.h   # 文件日志管理器实现
+│   │   ├── table_heap.h         # 表堆（页面链表）
+│   │   ├── table_page.h         # 槽式页面布局
+│   │   ├── table_iterator.h     # 表迭代器
+│   │   └── tuple.h              # 元组序列化
+│   ├── buffer/
+│   │   ├── buffer_pool_manager.h # 缓冲池管理器
+│   │   ├── lru_replacer.h       # LRU 替换策略
+│   │   └── page.h               # 内存页结构
+│   ├── index/
+│   │   ├── b_plus_tree.h        # B+ 树索引
+│   │   └── b_plus_tree_page.h   # B+ 树页面布局
+│   ├── execution/
+│   │   ├── sql_parser.h         # SQL 递归下降解析器 + AST
+│   │   ├── planner.h            # 执行计划构建器
+│   │   ├── executor.h           # 执行器基类（火山模型）
+│   │   ├── seq_scan_executor.h   # 全表扫描执行器
+│   │   ├── filter_executor.h    # 条件过滤执行器
+│   │   ├── projection_executor.h # 列投影 + 排序执行器
+│   │   ├── aggregation_executor.h # 聚合 + 分组执行器
+│   │   ├── index_scan_executor.h # 索引扫描执行器
+│   │   └── expression.h         # WHERE 表达式求值
+│   └── concurrency/
+│       ├── lock_manager.h       # 两阶段锁 + 死锁检测 + 事务管理
+│       └── transaction.h        # 事务上下文
+├── src/                         # 源文件实现
+│   ├── main.cpp                 # 入口 + 内置测试
+│   ├── db_engine.cpp            # 数据库引擎实现（含 DoRecovery）
+│   ├── storage/                 # 存储引擎实现
+│   ├── buffer/                  # 缓冲池实现
+│   ├── index/                   # B+ 树实现
+│   ├── execution/               # 执行器 + Planner 实现
+│   └── concurrency/             # 锁管理器 + 事务实现
+├── test/                        # 单元测试
+│   ├── concurrency/             # lock_manager_test, transaction_manager_test
+│   ├── index/                   # b_plus_tree_test
+│   └── storage/                 # table_page_test, table_heap_test
+├── CMakeLists.txt               # CMake 构建配置
+├── CMakePresets.json            # CMake 预设 (x64/x86 Debug/Release)
+└── LICENSE.txt                  # GPL-3.0 许可证
 ```
-
-## 🏗️ 架构设计
-
-```
-┌──────────────────────────────────────────────────────┐
-│  DBEngine — 数据库引擎入口                            │
-│  · 启动时执行 WAL 崩溃恢复 (REDO)                      │
-│  · ExecuteQuery() 分发 SQL 到解析→计划→执行管线        │
-├──────────────────────────────────────────────────────┤
-│  SQL解析器 → 执行计划生成器 → 执行器 (火山模型)         │
-├──────────────────────────────────────────────────────┤
-│  B+树索引  │  缓冲池管理器  │  锁管理器 (2PL)           │
-├──────────────────────────────────────────────────────┤
-│  磁盘管理器 (文件I/O)  │  WAL 日志管理器                │
-└──────────────────────────────────────────────────────┘
-```
-
-## ✨ 核心特性
-
-### 1. SQL 解析器（递归下降）
-支持以下 DDL / DML / 查询语句：
-
-```sql
--- 建表
-CREATE TABLE students (id, name, score);
-
--- 插入
-INSERT INTO students VALUES (1, 张三, 95.5);
-
--- 查询
-SELECT id, name FROM students WHERE score > 80;
-
--- 更新
-UPDATE students SET score = 100 WHERE id = 1;
-
--- 删除
-DELETE FROM students WHERE name = 张三;
-```
-
-WHERE 子句支持：`=`, `<>`, `<`, `>`, `<=`, `>=`, `AND`, `OR`，具备短路求值，智能数值/字符串比较。
-
-### 2. 火山模型执行器
-可组合的执行器管线：
-
-```
-SeqScanExecutor → FilterExecutor → ProjectionExecutor
-                → IndexScanExecutor (当查询命中首列索引)
-                → AggregationExecutor (COUNT/SUM/AVG/MIN/MAX + GROUP BY)
-```
-
-### 3. B+ 树索引
-- 内部节点存储 `(key, child_pointer)`
-- 叶子节点存储 `(key, tuple_data)`
-- 支持：**插入**、**点查询**、**范围扫描**、**标记删除**、**整树回收**
-- 节点分裂策略：`MoveHalfTo()` 分裂为两个半满节点
-- 线程安全的根节点锁 (`std::shared_mutex`)
-
-### 4. 缓冲池 + LRU 淘汰
-- 固定大小页面数组（默认 64 页，每页 4KB）
-- `FetchPage()`: 按需从磁盘加载页面到内存
-- `NewPage()`: 在磁盘上分配新页面
-- LRU 淘汰：通过双向链表 + 哈希表实现 O(1) 淘汰
-- WAL-before-write: 刷脏页前先刷日志
-- 页面级读写锁 (`std::shared_mutex`)
-
-### 5. 槽式页面布局 (Slotted Page)
-```
-┌──────────────┬──────────────────┬──────────────────┐
-│ Page Header  │ Slot Array →→→   │ ←←← Tuple Data   │
-│   (24 B)     │ (每槽 8 B)       │ (变长)           │
-└──────────────┴──────────────────┴──────────────────┘
-```
-- 表由多个 4KB 页通过链表组成 (TableHeap)
-- 每页头部 24 字节：page_id, LSN, 前后页指针, 空闲空间指针, 元组计数
-
-### 6. WAL 崩溃恢复
-- 启动时读取所有 WAL 日志记录
-- 识别已提交/已中止事务
-- REDO: 重放已提交事务的 INSERT/DELETE/UPDATE
-- UNDO: 回滚未提交事务（含崩溃时无 COMMIT/ABORT 记录的活跃事务）
-- 恢复后刷新所有脏页并截断 WAL 文件
-
-### 7. 两阶段锁 (2PL) 并发控制
-- `TwoPLManager`: 支持共享锁 (S) 和排他锁 (X)
-- `TransactionManager`: BEGIN → 操作 → COMMIT/ABORT
-- 隔离级别：READ_COMMITTED / REPEATABLE_READ / SERIALIZABLE
-- 锁表：基于表名（string key）的锁条目，跟踪持有者；事务锁集合类型与锁表统一
-
-    > ⚠️ 锁管理器（含死锁检测）已实现，但缓冲池和 B+ 树仍使用全局大锁，尚未在多线程生产环境下验证。
-
-## 🔧 构建与运行
-
-### 前置要求
-- **CMake** ≥ 3.10
-- **编译器**: MSVC 2022 (Windows) / GCC 13+ / Clang 16+
-- **构建生成器**: Ninja (推荐)
-
-### 构建步骤
-
-```powershell
-# 1. 克隆仓库
-git clone <repo-url>
-cd database
-
-# 2. 使用 CMake Preset 配置 (x64-debug)
-cmake --preset x64-debug
-
-# 3. 编译
-cmake --build --preset x64-debug
-
-# 4. 运行主程序演示
-.\build\x64-debug\bin\database.exe
-
-# 5. 运行测试
-ctest --preset x64-debug
-```
-
-### 构建目标
-
-| 目标 | 类型 | 说明 |
-|------|------|------|
-| `database` | 可执行文件 | 主程序演示 |
-| `concurrency_test` | 测试 | 锁管理器 + 事务管理器测试 |
-| `index_test` | 测试 | B+ 树索引测试 |
-| `table_page_test` | 测试 | 槽式页面测试 |
-| `table_heap_test` | 测试 | 表堆多页操作测试 |
-
-## 🧪 测试覆盖
-
-- **table_page_test**: 槽式页面的插入/读取/更新/删除/标记删除 (8+ 用例)
-- **table_heap_test**: 多页表的插入/读取/更新/删除/范围迭代 (6+ 用例)
-- **b_plus_tree_test**: 单键插入、批量插入 (1000 键)、点查询、范围扫描、删除、整树回收 (7+ 用例)
-- **concurrency_test**: 共享锁/排他锁基础、S-S 兼容性、S-X 冲突、事务生命周期 (10+ 用例)
-
-## 📋 已知限制 (TODO)
-
-### ✅ 已修复 (v1.2) — 隔离级别区分
-- **隔离级别**：`READ_COMMITTED` / `REPEATABLE_READ` / `SERIALIZABLE` 三种级别已通过**锁策略分化**实现行为差异：
-  - `READ_COMMITTED`：读操作使用共享锁，语句结束后释放（允许不可重复读）
-  - `REPEATABLE_READ`：读操作使用共享锁，持有到事务提交（保证可重复读）
-  - `SERIALIZABLE`：所有操作使用排他锁，持有到提交（完全串行化，防止幻读）
-- **多语句事务**：新增 `BEGIN` / `COMMIT` / `ABORT` SQL 支持，`BEGIN` 可选 `ISOLATION LEVEL` 子句指定隔离级别
-- **事务状态跟踪**：`Transaction` 新增 `ACTIVE → COMMITTED/ABORTED` 生命周期状态，`TransactionManager::Begin()` 记录快照 LSN
-
-### ✅ 已修复 (v1.1)
-- **编译错误**：~~`LockExclusiveInternal` 末尾重构残留导致编译失败~~ → ✅ 闭合大括号缩进已修正，与 `LockSharedInternal` 保持一致
-- **死锁检测失效**：~~构造函数未调用 `lock_manager_->SetTransactionManager()`~~ → ✅ 已添加调用，并在 `LockManager` 基类声明纯虚方法
-- **恢复缺陷**：~~无 COMMIT/ABORT 记录的活跃事务在 `DoRecovery()` 中被遗漏~~ → ✅ 按 ARIES 协议，活跃但无终止标记的事务归入 `aborted_txns` 并进入 UNDO 回滚
-- **Commit/Abort 空指针检查**：~~`if (!txn) return;` 在 `txn->` 解引用之后~~ → ✅ 空指针检查移至函数体最开头
-- **锁集合类型统一**：~~`Transaction` 锁集合使用 `RID`，与锁表 `string` key 不一致，6 处 `RID(0,0)` 硬编码~~ → ✅ 锁集合改为 `std::unordered_set<std::string>`，统一使用 `record_id`
-
-### 🟡 功能缺失
-- **死锁检测**：已实现（BFS 环路检测 + 受害者选择 + 自动中止重试），并有 2 个单元测试覆盖，但尚未在多线程生产环境下验证，`BufferPoolManager` 和 B+树仍使用全局大锁
-- **崩溃恢复 (ARIES)**：基础 REDO/UNDO 恢复已实现（`DoRecovery()` 按 LSN 顺序 REDO 已提交事务、反向 UNDO 未提交事务），但缺少 ARIES 完整协议特性：检查点(Checkpoint)、CLR 补偿日志记录、分析阶段(Analysis Phase)
-    - **SQL 特性缺失**：
-      - `JOIN` — 无 Join 算子，解析器仅支持单表 FROM
-      - `ORDER BY` — `SelectStmt` 中声明了字段但 SQL 解析器不解析，执行器侧也无排序算子
-      - `GROUP BY` — `SelectStmt` 中声明了字段但 SQL 解析器不设置（`AggregateExecutor` 内部已实现哈希分组逻辑，仅缺解析器侧连接）
-      - `DISTINCT` / `LIMIT` / `HAVING` — 完全未实现，代码库中无任何痕迹
-      - `DROP TABLE` — B+树 `Drop()` 和 `TableHeap::Drop()` 已实现，`BufferPoolManager` 也有回收接口，但 `SQLStmtType` 枚举和 `SQLParser::Parse()` 均不支持该语句
-      - 子查询 / 嵌套查询 — 完全未实现
-    - **查询优化器**：仅基于简单规则（单等值条件 → IndexScan，否则 SeqScan），无基于代价的优化器 (CBO)、无统计信息
-- **查询优化器**：仅基于简单规则（单等值条件 → IndexScan，否则 SeqScan），无基于代价的优化器 (CBO)
-- **预编译语句** (Prepared Statements)：完全未实现
-- **网络协议层**：无可远程访问的网络接口
-
-### 🟢 待改进
-- **B+树空间回收**：`Remove()` 仅标记删除（size 置 0），节点不合并、垃圾不回收，树只增长不收缩
-    - **磁盘页回收**：`FileDiskManager::DeallocatePage()` 仅将页面清零，未维护空闲页链表/位图，已删除表的磁盘空间无法复用
-    - **占位源文件**：`src/concurrency/transaction.cpp` 仅含一个 `const char` 占位变量以满足 CMake 编译目标，所有实现在头文件内联，不符合 .h/.cpp 分离惯例
-    - **Copilot 指令**：`.github/copilot-instructions.md` 为流水账描述，非结构化项目指南
-- **CI/CD**：`.github/workflows/` 为空目录，无自动化构建/测试流水线
-- **遗留文件**：`test/storage/CMakeLists.txt` 已全部注释（测试定义已迁移到根 `CMakeLists.txt`），可清理
-
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！请在提交 PR 前确保所有测试通过。
-
-## 📄 许可证
-
-本项目基于 **GPL-3.0** 许可证开源。详见 [LICENSE.txt](LICENSE.txt)。
 
 ---
 
-*该项目主要用于学习与研究，不适合生产环境使用。*
+## 📖 SQL 语法参考
+
+```sql
+-- DDL
+CREATE TABLE users (name, age, email);
+
+-- DDL: 删除表
+DROP TABLE users;
+
+-- DML: 插入
+INSERT INTO users VALUES ('Alice', '30', 'alice@example.com');
+INSERT INTO users VALUES ('Bob', '25', 'bob@example.com');
+
+-- 查询: 全表
+SELECT * FROM users;
+
+-- 查询: 指定列
+SELECT name, email FROM users;
+
+-- 查询: WHERE 条件
+SELECT * FROM users WHERE name = 'Alice';
+SELECT * FROM users WHERE age > '20' AND age < '40';
+SELECT * FROM users WHERE name = 'Alice' OR name = 'Bob';
+
+-- 查询: ORDER BY
+SELECT * FROM users ORDER BY age;
+SELECT * FROM users ORDER BY age DESC;
+
+-- 查询: 聚合 + GROUP BY
+SELECT COUNT(*) FROM users;
+SELECT AVG(age) FROM users;
+SELECT name, COUNT(*) FROM users GROUP BY name;
+
+-- 更新
+UPDATE users SET age = '31' WHERE name = 'Alice';
+UPDATE users SET email = 'new@example.com';
+
+-- 删除
+DELETE FROM users WHERE name = 'Bob';
+DELETE FROM users;  -- 清空表
+
+-- 事务
+BEGIN;
+INSERT INTO users VALUES ('Charlie', '28', 'charlie@ex.com');
+COMMIT;
+
+BEGIN;
+INSERT INTO users VALUES ('Eve', '35', 'eve@ex.com');
+ABORT;  -- 回滚
+```
+
+---
+
+## 🧪 测试覆盖
+
+| 测试套件 | 文件 | 覆盖内容 |
+|----------|------|----------|
+| `table_page_test` | `test/storage/table_page_test.cpp` | TablePage 插入/删除/更新/遍历 |
+| `table_heap_test` | `test/storage/table_heap_test.cpp` | TableHeap 多页面操作 |
+| `index_test` | `test/index/b_plus_tree_test.cpp` | B+ 树插入/查找/范围扫描/删除 |
+| `concurrency_test` | `test/concurrency/lock_manager_test.cpp` | 2PL 锁获取/释放/升级 |
+| `concurrency_test` | `test/concurrency/transaction_manager_test.cpp` | 事务 Begin/Commit/Abort 生命周期 |
+
+---
+
+## 🛠️ 技术栈
+
+- **语言**: C++20（concepts / `std::make_unique` / `std::optional` / `std::shared_mutex`）
+- **构建**: CMake 3.10+ + Ninja
+- **测试**: Google Test v1.14.0 (通过 FetchContent 自动下载)
+- **许可证**: GNU General Public License v3.0
+
+---
+
+## 🔮 后续规划
+
+- [x] 完整的 DROP TABLE 实现
+- [ ] 多列索引与复合索引
+- [ ] JOIN 操作符（Nested Loop / Hash Join）
+- [ ] 查询优化器（基于统计信息的代价估算）
+- [ ] 网络协议层（MySQL / PostgreSQL 兼容协议）
+- [ ] MVCC（多版本并发控制）
+- [ ] 真正的持久化 Catalog 系统
