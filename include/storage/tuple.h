@@ -18,11 +18,11 @@ enum class IsolationLevel;
  * 或将磁盘中读出的字节反序列化 (Deserialize) 为业务代码看得懂的结构。
  */
 class Tuple {
+ public:
+    Tuple() = default;
+
     // 合并两个 Tuple 的值列表（用于 JOIN 输出）
     static Tuple Merge(const Tuple& left, const Tuple& right);
-
-public:
-    Tuple() = default;
 
     // 从一组数值构建一条记录
     explicit Tuple(std::vector<std::string> values);
@@ -58,7 +58,7 @@ public:
 
     txn_id_t xmin_{0}; // 创建该 Tuple 的事务 ID（MVCC）
     txn_id_t xmax_{0}; // 删除该 Tuple 的事务 ID（MVCC，0=未删除）
-private:
+ private:
     std::vector<std::string> values_;
     RID rid_;
     uint32_t size_{0}; // 序列化后该占用的字节数

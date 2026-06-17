@@ -1,4 +1,4 @@
-﻿# 🗄️ Micro Database Engine — 微型关系数据库引擎
+# 🗄️ Micro Database Engine — 微型关系数据库引擎
 
 [![Language](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![License](https://img.shields.io/badge/License-GPL--3.0-green.svg)](LICENSE.txt)
@@ -334,4 +334,4 @@ ABORT;  -- 回滚
 - [ ] 查询优化器（基于统计信息的代价估算）
 - [ ] 网络协议层（MySQL / PostgreSQL 兼容协议）
 - [ ] MVCC（多版本并发控制）
-- [ ] 真正的持久化 Catalog 系统
+- [x] 真正的持久化 Catalog 系统

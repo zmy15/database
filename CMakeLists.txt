@@ -32,6 +32,7 @@ add_executable (database
     "src/index/b_plus_tree.cpp"
     "src/index/b_plus_tree_page.cpp"
     "src/execution/planner.cpp"
+    "src/execution/nested_loop_join_executor.cpp"
 )
 
 include_directories(include)

@@ -1,4 +1,4 @@
-﻿#include "db_engine.h"
+#include "db_engine.h"
 #include <iostream>
 #include <string>
 #include <system_error>
@@ -202,6 +202,38 @@ int main() {
         // ==========================================
         // 测试 DROP TABLE
         // ==========================================
+        // ==========================================
+        // 测试 15: JOIN — 隐式 INNER JOIN（逗号 + WHERE 等值）
+        // ==========================================
+        std::cout << "\n=== [Test 15] JOIN — Implicit INNER JOIN (comma + WHERE) ===" << std::endl;
+        engine.ExecuteQuery("CREATE TABLE join_a (id, info)");
+        engine.ExecuteQuery("CREATE TABLE join_b (id, detail)");
+        engine.ExecuteQuery("INSERT INTO join_a VALUES ('1', 'Alpha')");
+        engine.ExecuteQuery("INSERT INTO join_a VALUES ('2', 'Beta')");
+        engine.ExecuteQuery("INSERT INTO join_b VALUES ('1', 'Detail-A')");
+        engine.ExecuteQuery("INSERT INTO join_b VALUES ('2', 'Detail-B')");
+        engine.ExecuteQuery("INSERT INTO join_b VALUES ('3', 'Detail-C')");
+        std::cout << "--- Implicit JOIN (comma + WHERE) ---" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM join_a, join_b WHERE join_a.id = join_b.id");
+
+        // ==========================================
+        // 测试 15b: 显式 JOIN...ON 语法
+        // ==========================================
+        std::cout << "\n--- Explicit JOIN...ON ---" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM join_a JOIN join_b ON join_a.id = join_b.id");
+
+        // ==========================================
+        // 测试 15c: CROSS JOIN（无 ON 条件 — 笛卡尔积）
+        // ==========================================
+        std::cout << "\n--- CROSS JOIN (no ON clause, Cartesian product) ---" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM join_a, join_b");
+
+        // ==========================================
+        // 测试 15d: JOIN + WHERE 组合过滤
+        // ==========================================
+        std::cout << "\n--- JOIN + WHERE combined ---" << std::endl;
+        engine.ExecuteQuery("SELECT * FROM join_a, join_b WHERE join_a.id = join_b.id AND join_a.info = 'Alpha'");
+
         std::cout << "\n=== [Test DROP TABLE] ===" << std::endl;
         // 创建临时表
         engine.ExecuteQuery("CREATE TABLE temp_drop (col1, col2)");

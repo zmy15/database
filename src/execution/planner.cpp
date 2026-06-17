@@ -4,11 +4,78 @@
 #include "execution/projection_executor.h"
 #include "execution/aggregation_executor.h"
 #include "execution/index_scan_executor.h"
+#include "execution/nested_loop_join_executor.h"
 
 namespace db {
 
 std::unique_ptr<AbstractExecutor> Planner::CreatePlan(const SelectStmt* stmt) {
     if (!stmt) return nullptr;
+    // ============================================================
+    // JOIN 路径：为两表 INNER JOIN / CROSS JOIN 构建 Nested Loop Join
+    // ============================================================
+    if (stmt->has_join && stmt->table_names.size() >= 2) {
+        // 1. 获取左表信息
+        auto left_it = tables_.find(stmt->table_names[0]);
+        if (left_it == tables_.end()) return nullptr;
+        TableHeap* left_heap = left_it->second.get();
+
+        std::vector<std::string> left_schema;
+        auto ls_iter = table_schemas_.find(stmt->table_names[0]);
+        if (ls_iter != table_schemas_.end()) left_schema = ls_iter->second;
+
+        // 2. 获取右表信息
+        auto right_it = tables_.find(stmt->table_names[1]);
+        if (right_it == tables_.end()) return nullptr;
+        TableHeap* right_heap = right_it->second.get();
+
+        std::vector<std::string> right_schema;
+        auto rs_iter = table_schemas_.find(stmt->table_names[1]);
+        if (rs_iter != table_schemas_.end()) right_schema = rs_iter->second;
+
+        // 3. 构建叶子执行器（全表扫描，未来可扩展索引扫描）
+        auto left_exec = std::make_unique<SeqScanExecutor>(
+            left_heap, bpm_, txn_, lock_mgr_, stmt->table_names[0]);
+        auto right_exec = std::make_unique<SeqScanExecutor>(
+            right_heap, bpm_, txn_, lock_mgr_, stmt->table_names[1]);
+
+        // 4. 构建 NestedLoopJoinExecutor
+        std::unique_ptr<AbstractExecutor> executor = std::make_unique<NestedLoopJoinExecutor>(
+            std::move(left_exec), std::move(right_exec),
+            stmt->join_condition.get(), left_schema, right_schema);
+
+        // 5. WHERE 条件在 JOIN 之上额外过滤
+        if (stmt->condition) {
+            std::vector<std::string> merged_schema = left_schema;
+            merged_schema.insert(merged_schema.end(), right_schema.begin(), right_schema.end());
+            executor = std::make_unique<FilterExecutor>(
+                std::move(executor), stmt->condition.get(), merged_schema);
+        }
+
+        // 6. 列投影（非 SELECT * 且非聚合）
+        if (!stmt->columns.empty() &&
+            !left_schema.empty() && !right_schema.empty() &&
+            !stmt->has_aggregation) {
+            std::vector<std::string> merged_schema = left_schema;
+            merged_schema.insert(merged_schema.end(), right_schema.begin(), right_schema.end());
+            std::vector<int> col_indices;
+            for (const auto& col : stmt->columns) {
+                int idx = -1;
+                for (size_t i = 0; i < merged_schema.size(); ++i) {
+                    if (merged_schema[i] == col) { idx = static_cast<int>(i); break; }
+                }
+                col_indices.push_back(idx);
+            }
+            executor = std::make_unique<ProjectionExecutor>(
+                std::move(executor), col_indices, stmt->columns);
+        }
+
+        return executor;
+    }
+
+    // ============================================================
+    // 单表路径（原有逻辑完全不变）
+    // ============================================================
+
 
     // 查找目标表
     auto it = tables_.find(stmt->table_name);

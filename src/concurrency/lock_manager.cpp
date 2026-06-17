@@ -413,6 +413,11 @@ bool TransactionManager::IsAborted(txn_id_t txn_id) const {
 void TransactionManager::Abort(Transaction* txn) {
     if (!txn) return;
 
+    // 先执行物理 UNDO 回滚数据变更（死锁 victim / 用户 ABORT 统一走此路径）
+    if (undo_callback_) {
+        undo_callback_(txn->GetTransactionId());
+    }
+
     // 更新事务状态为已中止
     txn->SetState(TransactionState::ABORTED);
 

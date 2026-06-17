@@ -5,6 +5,7 @@
 #include "concurrency/lock_manager.h"
 #include "concurrency/transaction.h"
 #include <iostream>
+#include <cstring>
 
 namespace db {
 
@@ -25,6 +26,11 @@ DBEngine::DBEngine(const std::string& db_file, size_t buffer_pool_size) {
 
     lock_manager_->SetTransactionManager(txn_manager_.get());
 
+    // 注册 UNDO 回调：死锁 victim 和用户 ABORT 统一由此路径回滚数据变更
+    txn_manager_->SetUndoCallback([this](txn_id_t tid) {
+        ApplyUndoForTransaction(tid);
+    });
+
     // 5. 创建 SQL 解析器
     parser_ = std::make_unique<SQLParser>();
 
@@ -36,12 +42,17 @@ DBEngine::DBEngine(const std::string& db_file, size_t buffer_pool_size) {
         lock_manager_.get(),
         txn_manager_.get());
 
-    // 7. 崩溃恢复：REDO 已提交事务
+    // 7. 从 Catalog 加载持久化的表结构
+    LoadCatalog();
+
+    // 8. 崩溃恢复：REDO 已提交事务
     DoRecovery();
 }
 
 DBEngine::~DBEngine() {
     // 析构顺序：先清理 table_heap（会 unpin 页面），再清理 BPM，最后清理磁盘
+    // 正常退出前保存 Catalog
+    SaveCatalog();
     tables_.clear();
     indexes_.clear();
     if (log_manager_) {
@@ -75,8 +86,6 @@ void DBEngine::DoRecovery() {
     }
 
     // 2. 构建事务状态表：每个 txn_id 的最终状态
-    //    committed_txns: 已提交的事务集合
-    //    aborted_txns: 已中止的事务集合
     std::unordered_set<txn_id_t> committed_txns;
     std::unordered_set<txn_id_t> aborted_txns;
 
@@ -91,7 +100,6 @@ void DBEngine::DoRecovery() {
     }
 
     // 3. 收集活跃但无终止标记的事务（崩溃时正在运行的事务）
-    //    按 ARIES 协议，未提交事务应视为 aborted 并执行 UNDO
     for (const auto& rec : records) {
         if (rec.op_type == LogOpType::INSERT ||
             rec.op_type == LogOpType::DELETE ||
@@ -106,21 +114,18 @@ void DBEngine::DoRecovery() {
     // 4. REDO：按 LSN 顺序重放已提交事务的操作
     for (const auto& rec : records) {
         if (committed_txns.count(rec.txn_id) == 0) {
-            continue; // 跳过未提交/已中止的事务
+            continue;
         }
 
-        // 只重放数据操作（INSERT/DELETE/UPDATE），跳过控制记录
         if (rec.op_type != LogOpType::INSERT &&
             rec.op_type != LogOpType::DELETE &&
             rec.op_type != LogOpType::UPDATE) {
             continue;
         }
 
-        // 获取目标页面
         Page* page = buffer_pool_manager_->FetchPage(rec.page_id);
         if (!page) continue;
 
-        // REDO 幂等性保护：如果页面 LSN 已经 >= 日志 LSN，说明该操作已落盘，跳过
         if (page->GetLSN() >= rec.lsn) {
             buffer_pool_manager_->UnpinPage(rec.page_id, false);
             continue;
@@ -130,17 +135,14 @@ void DBEngine::DoRecovery() {
 
         switch (rec.op_type) {
         case LogOpType::INSERT:
-            // REDO INSERT：写入 new_tuple
             if (rec.new_tuple.GetSize() > 0) {
                 tp->InsertTuple(rec.new_tuple, nullptr);
             }
             break;
         case LogOpType::DELETE:
-            // REDO DELETE：标记删除
             tp->MarkDelete(rec.slot_num);
             break;
         case LogOpType::UPDATE:
-            // REDO UPDATE：写入 new_tuple
             if (rec.new_tuple.GetSize() > 0) {
                 tp->UpdateTuple(rec.slot_num, rec.new_tuple);
             }
@@ -149,7 +151,6 @@ void DBEngine::DoRecovery() {
             break;
         }
 
-        // REDO 完成后更新页面 LSN，防止后续恢复重复应用
         page->SetLSN(rec.lsn);
         buffer_pool_manager_->UnpinPage(rec.page_id, true);
     }
@@ -159,8 +160,7 @@ void DBEngine::DoRecovery() {
         ApplyUndoForTransaction(tid);
     }
 
-    // 5.5 将恢复识别出的已提交/已中止事务注册到 TransactionManager（MVCC 可见性判断用）
-    // 崩溃前运行的事务无 TransactionManager 记录，需手动注入，使 IsVisible() 能正确判断
+    // 5.5 将恢复识别出的已提交/已中止事务注册到 TransactionManager
     for (txn_id_t tid : committed_txns) {
         txn_manager_->MarkCommitted(tid);
     }
@@ -171,7 +171,7 @@ void DBEngine::DoRecovery() {
     // 6. 将恢复后的所有脏页刷盘
     buffer_pool_manager_->FlushAllPages();
 
-    // 7. 截断 WAL（恢复完成后日志可丢弃）
+    // 7. 截断 WAL
     lsn_t last_lsn = records.back().lsn;
     log_manager_->TruncateAfter(last_lsn);
 
@@ -182,25 +182,18 @@ void DBEngine::DoRecovery() {
 }
 
 void DBEngine::ApplyUndoForTransaction(txn_id_t txn_id) {
-    // ⚠️ 此方法仅供崩溃恢复（DoRecovery）使用。
-    // 正常运行时的 Abort 已改为 MVCC 模式：仅标记事务 ABORTED，
-    // 其 xmin/xmax 在 IsVisible() 中自动失效，无需物理回滚页面。
-    // 1. 读取 WAL 中所有日志记录
     auto records = log_manager_->ReadLogRecords();
 
-    // 2. 逆序遍历，只处理该事务的 INSERT/DELETE/UPDATE
     for (auto it = records.rbegin(); it != records.rend(); ++it) {
         const auto& rec = *it;
         if (rec.txn_id != txn_id) continue;
 
-        // 只处理数据操作，跳过控制记录（BEGIN/COMMIT/ABORT）
         if (rec.op_type != LogOpType::INSERT &&
             rec.op_type != LogOpType::DELETE &&
             rec.op_type != LogOpType::UPDATE) {
             continue;
         }
 
-        // 3. 获取目标页面
         Page* page = buffer_pool_manager_->FetchPage(rec.page_id);
         if (!page) {
             std::cerr << "[UNDO] txn #" << txn_id
@@ -210,10 +203,8 @@ void DBEngine::ApplyUndoForTransaction(txn_id_t txn_id) {
 
         auto* tp = reinterpret_cast<TablePage*>(page);
 
-        // 4. 执行 TablePage 级补偿操作 + B+ 树索引恢复
         switch (rec.op_type) {
         case LogOpType::INSERT:
-            // UNDO INSERT：标记删除 + 移除索引
             tp->MarkDelete(rec.slot_num);
             if (!rec.table_name.empty()) {
                 auto idx_it = indexes_.find(rec.table_name);
@@ -226,7 +217,6 @@ void DBEngine::ApplyUndoForTransaction(txn_id_t txn_id) {
             }
             break;
         case LogOpType::DELETE:
-            // UNDO DELETE：重新插入旧元组 + 恢复索引
             if (rec.old_tuple.GetSize() > 0) {
                 tp->InsertTuple(rec.old_tuple, nullptr);
                 if (!rec.table_name.empty()) {
@@ -241,20 +231,17 @@ void DBEngine::ApplyUndoForTransaction(txn_id_t txn_id) {
             }
             break;
         case LogOpType::UPDATE:
-            // UNDO UPDATE：恢复旧值 + 恢复旧索引 key
             if (rec.old_tuple.GetSize() > 0) {
                 tp->UpdateTuple(rec.slot_num, rec.old_tuple);
                 if (!rec.table_name.empty()) {
                     auto idx_it = indexes_.find(rec.table_name);
                     if (idx_it != indexes_.end()) {
-                        // 移除 new_tuple 的 key（如果不同于 old key）
                         if (rec.new_tuple.GetSize() > 0) {
                             const auto& new_vals = rec.new_tuple.GetValues();
                             if (!new_vals.empty()) {
                                 idx_it->second->Remove(new_vals[0]);
                             }
                         }
-                        // 恢复 old_tuple 的 key
                         const auto& old_vals = rec.old_tuple.GetValues();
                         if (!old_vals.empty()) {
                             idx_it->second->Insert(old_vals[0], rec.old_tuple, 0);
@@ -271,6 +258,171 @@ void DBEngine::ApplyUndoForTransaction(txn_id_t txn_id) {
     }
 }
 
+// ============================================================
+// Catalog 持久化：从 page_id=0 读取/写入表结构
+// ============================================================
+
+void DBEngine::LoadCatalog() {
+    auto* fdm = dynamic_cast<FileDiskManager*>(disk_manager_.get());
+    if (!fdm || !fdm->HasCatalogHeader()) {
+        std::cout << "[Catalog] No catalog header found, starting with empty schema." << std::endl;
+        return;
+    }
+
+    char page_data[PAGE_SIZE];
+    fdm->ReadCatalogPage(page_data);
+
+    // 读取 version 判断格式版本
+    uint32_t catalog_version = *reinterpret_cast<uint32_t*>(page_data + 4);
+
+    // 跳过 8 字节头部 (magic 4B + version 4B)
+    uint32_t offset = 8;
+    uint32_t num_tables = *reinterpret_cast<uint32_t*>(page_data + offset);
+    offset += sizeof(uint32_t);
+
+    for (uint32_t i = 0; i < num_tables; ++i) {
+        // 读取表名
+        if (offset + sizeof(uint32_t) > PAGE_SIZE) break;
+        uint32_t name_len = *reinterpret_cast<uint32_t*>(page_data + offset);
+        offset += sizeof(uint32_t);
+        if (offset + name_len > PAGE_SIZE) break;
+        std::string table_name(page_data + offset, name_len);
+        offset += name_len;
+
+        // 读取列名列表
+        if (offset + sizeof(uint32_t) > PAGE_SIZE) break;
+        uint32_t col_count = *reinterpret_cast<uint32_t*>(page_data + offset);
+        offset += sizeof(uint32_t);
+        std::vector<std::string> columns;
+        for (uint32_t j = 0; j < col_count; ++j) {
+            if (offset + sizeof(uint32_t) > PAGE_SIZE) break;
+            uint32_t col_len = *reinterpret_cast<uint32_t*>(page_data + offset);
+            offset += sizeof(uint32_t);
+            if (offset + col_len > PAGE_SIZE) break;
+            std::string col_name(page_data + offset, col_len);
+            offset += col_len;
+            columns.push_back(col_name);
+        }
+
+        table_schemas_[table_name] = columns;
+
+        // 读取表数据页指针和索引信息（v2 新增，共 16 字节）
+        page_id_t first_page = INVALID_PAGE_ID;
+        page_id_t last_page  = INVALID_PAGE_ID;  // Load() 会自行计算尾页
+        uint32_t has_index   = 0;
+        page_id_t index_root = INVALID_PAGE_ID;
+
+        if (catalog_version >= 2) {
+            if (offset + 16 <= PAGE_SIZE) {
+                first_page = *reinterpret_cast<page_id_t*>(page_data + offset); offset += 4;
+                last_page  = *reinterpret_cast<page_id_t*>(page_data + offset); offset += 4;
+                has_index  = *reinterpret_cast<uint32_t*>(page_data + offset);  offset += 4;
+                index_root = *reinterpret_cast<page_id_t*>(page_data + offset); offset += 4;
+            }
+        }
+
+        // 创建或恢复 TableHeap（不再调用 GetOrCreateTable，避免分配新页）
+        auto heap = std::make_unique<TableHeap>(buffer_pool_manager_.get());
+        if (first_page != INVALID_PAGE_ID) {
+            heap->Load(first_page);  // 重连已有数据页链表
+        } else {
+            heap->Init();            // 旧格式 Catalog 或空表：分配新页
+        }
+        tables_[table_name] = std::move(heap);
+
+        // 恢复 B+ 树索引
+        if (has_index) {
+            auto idx = std::make_unique<BPlusTree>(table_name, buffer_pool_manager_.get());
+            if (index_root != INVALID_PAGE_ID) {
+                idx->SetRootPageId(index_root);
+            }
+            indexes_[table_name] = std::move(idx);
+        }
+
+        std::cout << "[Catalog] Loaded table '" << table_name
+                  << "' (" << col_count << " columns, first_page=" << first_page
+                  << ", index=" << (has_index ? "yes" : "no") << ")." << std::endl;
+    }
+}
+
+void DBEngine::SaveCatalog() {
+    auto* fdm = dynamic_cast<FileDiskManager*>(disk_manager_.get());
+    if (!fdm || !fdm->HasCatalogHeader()) {
+        std::cerr << "[Catalog] No catalog header, cannot save." << std::endl;
+        return;
+    }
+
+    char page_data[PAGE_SIZE] = {0};
+
+    // 写入 magic + version
+    uint32_t magic = DB_CATALOG_MAGIC;
+    uint32_t version = DB_CATALOG_VERSION;
+    std::memcpy(page_data, &magic, 4);
+    std::memcpy(page_data + 4, &version, 4);
+
+    uint32_t offset = 8;
+    uint32_t num_tables = static_cast<uint32_t>(table_schemas_.size());
+    std::memcpy(page_data + offset, &num_tables, sizeof(uint32_t));
+    offset += sizeof(uint32_t);
+
+    for (const auto& [table_name, columns] : table_schemas_) {
+        // 写入表名
+        uint32_t name_len = static_cast<uint32_t>(table_name.size());
+        if (offset + sizeof(uint32_t) + name_len > PAGE_SIZE) {
+            std::cerr << "[Catalog] Catalog page overflow!" << std::endl;
+            return;
+        }
+        std::memcpy(page_data + offset, &name_len, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        std::memcpy(page_data + offset, table_name.data(), name_len);
+        offset += name_len;
+
+        // 写入列名列表
+        uint32_t col_count = static_cast<uint32_t>(columns.size());
+        std::memcpy(page_data + offset, &col_count, sizeof(uint32_t));
+        offset += sizeof(uint32_t);
+        for (const auto& col : columns) {
+            uint32_t col_len = static_cast<uint32_t>(col.size());
+            if (offset + sizeof(uint32_t) + col_len > PAGE_SIZE) {
+                std::cerr << "[Catalog] Catalog page overflow!" << std::endl;
+                return;
+            }
+            std::memcpy(page_data + offset, &col_len, sizeof(uint32_t));
+            offset += sizeof(uint32_t);
+            std::memcpy(page_data + offset, col.data(), col_len);
+            offset += col_len;
+        }
+
+        // 写入表数据页指针和索引信息（v2 新增，共 16 字节）
+        page_id_t first_page = INVALID_PAGE_ID;
+        page_id_t last_page = INVALID_PAGE_ID;
+        auto tbl_it = tables_.find(table_name);
+        if (tbl_it != tables_.end()) {
+            first_page = tbl_it->second->GetFirstPageId();
+            last_page = tbl_it->second->GetLastPageId();
+        }
+
+        uint32_t has_index = 0;
+        page_id_t index_root = INVALID_PAGE_ID;
+        auto idx_it = indexes_.find(table_name);
+        if (idx_it != indexes_.end()) {
+            has_index = 1;
+            index_root = idx_it->second->GetRootPageId();
+        }
+
+        if (offset + 16 > PAGE_SIZE) {
+            std::cerr << "[Catalog] Catalog page overflow!" << std::endl;
+            return;
+        }
+        std::memcpy(page_data + offset, &first_page, 4); offset += 4;
+        std::memcpy(page_data + offset, &last_page, 4);  offset += 4;
+        std::memcpy(page_data + offset, &has_index, 4);   offset += 4;
+        std::memcpy(page_data + offset, &index_root, 4);  offset += 4;
+    }
+
+    fdm->WriteCatalogPage(page_data);
+}
+
 void DBEngine::ExecuteQuery(const std::string& sql) {
     // 1. 解析 SQL
     auto stmt = parser_->Parse(sql);
@@ -285,12 +437,17 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
         auto& ct = static_cast<CreateTableStmt&>(*stmt);
         GetOrCreateTable(ct.table_name);
         table_schemas_[ct.table_name] = ct.columns;
+        // 自动对第一列创建 B+ 树索引（索引根页在首次 INSERT 时延迟分配）
+        if (!ct.columns.empty()) {
+            auto idx = std::make_unique<BPlusTree>(ct.table_name, buffer_pool_manager_.get());
+            indexes_[ct.table_name] = std::move(idx);
+        }
+        SaveCatalog();  // 持久化到 Catalog
         std::cout << "[OK] Table '" << ct.table_name << "' created." << std::endl;
         break;
     }
     case SQLStmtType::DROP_TABLE: {
         auto& dt = static_cast<DropTableStmt&>(*stmt);
-        // 对不存在的表报错
         if (tables_.find(dt.table_name) == tables_.end()) {
             std::cerr << "[ERR] Table '" << dt.table_name << "' not found." << std::endl;
             return;
@@ -309,6 +466,7 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
         }
         // 3. 清理 schema
         table_schemas_.erase(dt.table_name);
+        SaveCatalog();  // 从 Catalog 中移除该表
         std::cout << "[OK] Table '" << dt.table_name << "' dropped." << std::endl;
         break;
     }
@@ -316,7 +474,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
         auto& ins = static_cast<InsertStmt&>(*stmt);
         TableHeap* heap = GetOrCreateTable(ins.table_name);
 
-        // 事务处理：多语句事务复用 current_txn_，否则 auto-commit
         Transaction* txn = nullptr;
         bool auto_commit = false;
         if (current_txn_) {
@@ -324,7 +481,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
         } else {
             txn = txn_manager_->Begin();
             auto_commit = true;
-            // auto-commit 模式下获取排他锁
             if (lock_manager_) {
                 lock_manager_->LockExclusive(txn, ins.table_name);
             }
@@ -332,7 +488,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
 
         RID rid;
         if (heap->InsertTuple(ins.tuple, &rid)) {
-            // WAL 日志：记录 INSERT 操作（先插入后写日志以获取 slot_num）
             if (log_manager_) {
                 LogRecord record;
                 record.txn_id = txn->GetTransactionId();
@@ -346,7 +501,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
                 txn->SetPrevLSN(lsn);
             }
 
-            // 索引维护：为新插入的元组更新索引
             auto idx_it = indexes_.find(ins.table_name);
             if (idx_it != indexes_.end()) {
                 const auto& vals = ins.tuple.GetValues();
@@ -359,7 +513,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
             std::cerr << "[ERR] Insert failed." << std::endl;
         }
 
-        // auto-commit：立即提交（释放锁 + 写 COMMIT 日志）
         if (auto_commit) {
             txn_manager_->Commit(txn);
         }
@@ -367,13 +520,7 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
     }
     case SQLStmtType::SELECT: {
         auto& sel = static_cast<SelectStmt&>(*stmt);
-        auto it = tables_.find(sel.table_name);
-        if (it == tables_.end()) {
-            std::cerr << "[ERR] Table '" << sel.table_name << "' not found." << std::endl;
-            return;
-        }
 
-        // 事务处理：多语句事务复用 current_txn_，否则 auto-commit
         Transaction* txn = nullptr;
         bool auto_commit = false;
         if (current_txn_) {
@@ -383,22 +530,37 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
             auto_commit = true;
         }
         if (lock_manager_ && auto_commit) {
-            // 根据隔离级别选择锁策略（auto-commit 模式下立即获取锁）
-            switch (txn->GetIsolationLevel()) {
-            case IsolationLevel::SERIALIZABLE:
-                lock_manager_->LockExclusiveForRead(txn, sel.table_name);
-                break;
-            case IsolationLevel::REPEATABLE_READ:
-                lock_manager_->LockShared(txn, sel.table_name);
-                break;
-            case IsolationLevel::READ_COMMITTED:
-            default:
-                lock_manager_->LockSharedForRead(txn, sel.table_name);
-                break;
+            if (sel.has_join) {
+                for (const auto& tbl : sel.table_names) {
+                    switch (txn->GetIsolationLevel()) {
+                    case IsolationLevel::SERIALIZABLE:
+                        lock_manager_->LockExclusiveForRead(txn, tbl);
+                        break;
+                    case IsolationLevel::REPEATABLE_READ:
+                        lock_manager_->LockShared(txn, tbl);
+                        break;
+                    case IsolationLevel::READ_COMMITTED:
+                    default:
+                        lock_manager_->LockSharedForRead(txn, tbl);
+                        break;
+                    }
+                }
+            } else {
+                switch (txn->GetIsolationLevel()) {
+                case IsolationLevel::SERIALIZABLE:
+                    lock_manager_->LockExclusiveForRead(txn, sel.table_name);
+                    break;
+                case IsolationLevel::REPEATABLE_READ:
+                    lock_manager_->LockShared(txn, sel.table_name);
+                    break;
+                case IsolationLevel::READ_COMMITTED:
+                default:
+                    lock_manager_->LockSharedForRead(txn, sel.table_name);
+                    break;
+                }
             }
         }
 
-        // 使用 Planner 构建执行器树（SeqScan → Filter → Projection）
         auto executor = planner_->CreatePlan(&sel);
         if (!executor) {
             std::cerr << "[ERR] Failed to create execution plan." << std::endl;
@@ -421,7 +583,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
             std::cout << "]" << std::endl;
         }
 
-        // auto-commit：立即提交（释放锁）
         if (auto_commit) {
             txn_manager_->Commit(txn);
         }
@@ -436,7 +597,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
             return;
         }
 
-        // 事务处理：多语句事务复用 current_txn_，否则 auto-commit
         Transaction* txn = nullptr;
         bool auto_commit = false;
         if (current_txn_) {
@@ -452,27 +612,22 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
         int count = 0;
         TableHeap* heap = it->second.get();
 
-        // 获取 schema（用于 WHERE 条件求值）
         std::vector<std::string> schema;
         auto schema_iter = table_schemas_.find(del.table_name);
         if (schema_iter != table_schemas_.end()) {
             schema = schema_iter->second;
         }
 
-        // 遍历表堆，对匹配 WHERE 条件的元组执行标记删除
         for (auto iter = heap->Begin(); iter != heap->End(); ++iter) {
             auto opt = iter.Get();
             if (!opt.has_value()) continue;
 
-            // 存在 WHERE 条件则求值，不匹配则跳过
             if (del.condition && !del.condition->Evaluate(opt.value(), schema)) {
                 continue;
             }
 
-            // 保存旧值（用于 WAL 日志和 UNDO）
             Tuple old_tuple = opt.value();
 
-            // 索引维护：从索引中移除即将删除的元组
             auto idx_it_del = indexes_.find(del.table_name);
             if (idx_it_del != indexes_.end()) {
                 const auto& vals = old_tuple.GetValues();
@@ -483,7 +638,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
 
             if (heap->DeleteTuple(iter.GetRID())) {
                 count++;
-                // WAL 日志：记录 DELETE 操作（含 old_tuple 用于 UNDO）
                 if (log_manager_) {
                     LogRecord record;
                     record.txn_id = txn->GetTransactionId();
@@ -499,7 +653,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
             }
         }
 
-        // auto-commit：立即提交
         if (auto_commit) {
             txn_manager_->Commit(txn);
         }
@@ -515,7 +668,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
             return;
         }
 
-        // 事务处理：多语句事务复用 current_txn_，否则 auto-commit
         Transaction* txn = nullptr;
         bool auto_commit = false;
         if (current_txn_) {
@@ -531,15 +683,12 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
         int count = 0;
         TableHeap* heap = it->second.get();
 
-        // 获取 schema
         std::vector<std::string> schema;
         auto schema_iter = table_schemas_.find(upd.table_name);
         if (schema_iter != table_schemas_.end()) {
             schema = schema_iter->second;
         }
 
-        // 遍历表堆，对匹配 WHERE 条件的元组执行更新
-        // 使用两遍扫描：先收集 RID 和新旧元组，再逐个更新（避免迭代器失效）
         struct UpdateEntry {
             RID rid;
             Tuple old_tuple;
@@ -554,10 +703,8 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
                 continue;
             }
 
-            // 构造新元组：复制原值，替换指定列
             auto old_vals = opt->GetValues();
             for (size_t i = 0; i < upd.col_names.size(); ++i) {
-                // 在 schema 中查找列索引
                 for (size_t j = 0; j < schema.size(); ++j) {
                     if (schema[j] == upd.col_names[i]) {
                         if (j < old_vals.size()) {
@@ -572,14 +719,10 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
             to_update.push_back({iter.GetRID(), opt.value(), new_tuple});
         }
 
-        // 第二遍：执行更新（含索引维护 + WAL 日志）
         for (auto& entry : to_update) {
             auto idx_it_upd = indexes_.find(upd.table_name);
 
-            // 判断是否可原地更新（尺寸相同 → 原地覆盖；尺寸不同 → 删旧插新）
             if (entry.old_tuple.GetSize() == entry.new_tuple.GetSize()) {
-                // === 原地更新路径 ===
-                // 索引维护：先移除旧索引条目
                 if (idx_it_upd != indexes_.end()) {
                     const auto& old_vals = entry.old_tuple.GetValues();
                     if (!old_vals.empty()) {
@@ -589,7 +732,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
 
                 if (heap->UpdateTuple(entry.rid, entry.new_tuple)) {
                     count++;
-                    // WAL 日志：记录 UPDATE 操作（含 old_tuple/new_tuple）
                     if (log_manager_) {
                         LogRecord record;
                         record.txn_id = txn->GetTransactionId();
@@ -603,7 +745,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
                         lsn_t lsn = log_manager_->AppendLogRecord(record);
                         txn->SetPrevLSN(lsn);
                     }
-                    // 索引维护：插入新索引条目
                     if (idx_it_upd != indexes_.end()) {
                         const auto& new_vals = entry.new_tuple.GetValues();
                         if (!new_vals.empty()) {
@@ -611,7 +752,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
                         }
                     }
                 } else {
-                    // 更新失败：恢复旧索引条目
                     if (idx_it_upd != indexes_.end()) {
                         const auto& old_vals = entry.old_tuple.GetValues();
                         if (!old_vals.empty()) {
@@ -620,8 +760,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
                     }
                 }
             } else {
-                // === 尺寸不匹配：拆为 DELETE + INSERT 两条 WAL 日志 ===
-                // 1. 写 DELETE WAL 日志（记录旧元组所在槽位，供 UNDO 恢复）
                 if (log_manager_) {
                     LogRecord del_record;
                     del_record.txn_id = txn->GetTransactionId();
@@ -635,7 +773,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
                     txn->SetPrevLSN(del_lsn);
                 }
 
-                // 索引维护：移除旧索引条目
                 if (idx_it_upd != indexes_.end()) {
                     const auto& old_vals = entry.old_tuple.GetValues();
                     if (!old_vals.empty()) {
@@ -643,14 +780,11 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
                     }
                 }
 
-                // 2. 标记删除旧元组
                 heap->DeleteTuple(entry.rid);
 
-                // 3. 插入新元组，获取新 RID
                 RID new_rid;
                 if (heap->InsertTuple(entry.new_tuple, &new_rid)) {
                     count++;
-                    // 写 INSERT WAL 日志（记录新元组所在槽位，供 UNDO 回滚）
                     if (log_manager_) {
                         LogRecord ins_record;
                         ins_record.txn_id = txn->GetTransactionId();
@@ -663,7 +797,6 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
                         lsn_t ins_lsn = log_manager_->AppendLogRecord(ins_record);
                         txn->SetPrevLSN(ins_lsn);
                     }
-                    // 索引维护：插入新索引条目
                     if (idx_it_upd != indexes_.end()) {
                         const auto& new_vals = entry.new_tuple.GetValues();
                         if (!new_vals.empty()) {
@@ -671,12 +804,9 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
                         }
                     }
                 }
-                // 注意：InsertTuple 失败时，旧元组已被标记删除但新元组未插入，
-                // 旧索引条目已移除，数据处于不一致状态。实际场景中极少发生（磁盘满等）。
             }
         }
 
-        // auto-commit：立即提交
         if (auto_commit) {
             txn_manager_->Commit(txn);
         }
@@ -713,10 +843,12 @@ void DBEngine::ExecuteQuery(const std::string& sql) {
             break;
         }
         txn_id_t tid = current_txn_->GetTransactionId();
-        // MVCC 模式：Abort 后 xmin/xmax 通过 IsAborted() 判断自动失效，无需物理回滚
+        // UNDO 已由 Abort() 内部 undo_callback_ 统一执行
         txn_manager_->Abort(current_txn_);
         current_txn_ = nullptr;
-        std::cout << "[OK] Transaction #" << tid << " aborted." << std::endl;
+        // 将 UNDO 后的脏页刷盘确保持久化
+        buffer_pool_manager_->FlushAllPages();
+        std::cout << "[OK] Transaction #" << tid << " aborted (all changes rolled back)." << std::endl;
         break;
     }
     default:

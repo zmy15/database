@@ -53,6 +53,9 @@ public:
     /** 获取根页 ID（供测试用） */
     page_id_t GetRootPageId() const { return root_page_id_; }
 
+    /** 从已有根页恢复索引（数据库重启后重建 B+ 树对象时调用） */
+    void SetRootPageId(page_id_t root_id) { root_page_id_ = root_id; }
+
     /** 删除整棵 B+ 树：遍历所有页面，回收空间 */
     void Drop();
 

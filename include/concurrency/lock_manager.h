@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <functional>
 
 namespace db {
 
@@ -80,6 +81,9 @@ public:
     TransactionManager(LockManager* lock_manager, LogManager* log_manager = nullptr);
     Transaction* Begin(IsolationLevel iso_level = IsolationLevel::READ_COMMITTED);
     void Commit(Transaction* txn);
+    // 设置物理 UNDO 回调（由 DBEngine 注入，死锁 victim / 用户 ABORT 统一触发）
+    void SetUndoCallback(std::function<void(txn_id_t)> callback) { undo_callback_ = std::move(callback); }
+
     void Abort(Transaction* txn);
     // 通过事务 ID 获取事务对象（供死锁检测使用）
     Transaction* GetTransaction(txn_id_t txn_id);
@@ -101,6 +105,7 @@ private:
     std::mutex mutex_;
     std::unordered_map<txn_id_t, std::unique_ptr<Transaction>> txn_map_;
     txn_id_t next_txn_id_{0};
+    std::function<void(txn_id_t)> undo_callback_;
 };
 
 } // namespace db

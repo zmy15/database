@@ -38,6 +38,8 @@ public:
 
     page_id_t GetFirstPageId() const { return first_page_id_; }
 
+    page_id_t GetLastPageId() const { return last_page_id_; }
+
     // 删除整张表：遍历所有页面，回收空间
     void Drop();
 private:

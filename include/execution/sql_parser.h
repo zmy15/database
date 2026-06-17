@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "storage/tuple.h"
 #include "execution/expression.h"
@@ -52,6 +52,10 @@ struct SelectStmt : SQLStmt {
     bool order_desc = false;               // ORDER BY 是否降序（默认 ASC）
     bool has_aggregation = false;          // 是否包含聚合函数
     std::vector<std::string> group_by_cols; // GROUP BY 列名列表
+        // ===== JOIN 支持 =====
+        std::vector<std::string> table_names;  // 多表名列表（JOIN 场景）
+        std::unique_ptr<Expression> join_condition; // JOIN...ON 条件（显式 JOIN 时有效）
+        bool has_join = false;                 // 是否为 JOIN 查询
     SelectStmt() { type = SQLStmtType::SELECT; }
 };
 
@@ -205,7 +209,8 @@ private:
         size_t start = cond_pos_;
         while (cond_pos_ < cond_input_.size() &&
                (std::isalnum(static_cast<unsigned char>(cond_input_[cond_pos_])) ||
-                cond_input_[cond_pos_] == '_')) {
+                cond_input_[cond_pos_] == '_' ||
+                cond_input_[cond_pos_] == '.')) {
             ++cond_pos_;
         }
         if (cond_pos_ == start) return "";
@@ -438,10 +443,63 @@ public:
         if (group_pos != std::string::npos && (table_end == std::string::npos || group_pos < table_end)) table_end = group_pos;
         if (order_pos != std::string::npos && (table_end == std::string::npos || order_pos < table_end)) table_end = order_pos;
 
+        // 提取表名区域（在 WHERE / GROUP BY / ORDER BY 之前）
+        std::string table_part;
         if (table_end != std::string::npos) {
-            stmt->table_name = Trim(after_from.substr(0, table_end));
+            table_part = Trim(after_from.substr(0, table_end));
         } else {
-            stmt->table_name = Trim(after_from);
+            table_part = Trim(after_from);
+        }
+
+        // 检测 JOIN 语法（显式 JOIN...ON 或隐式逗号分隔多表）
+        std::string upper_table_part = ToUpper(table_part);
+        size_t join_pos = upper_table_part.find(" JOIN ");
+        size_t comma_pos = table_part.find(',');
+
+        if (comma_pos != std::string::npos || join_pos != std::string::npos) {
+            // === JOIN 路径 ===
+            stmt->has_join = true;
+
+            if (join_pos != std::string::npos) {
+                // 显式 JOIN...ON 语法：左表 JOIN 右表 ON 条件
+                std::string left_table = Trim(table_part.substr(0, join_pos));
+                stmt->table_names.push_back(left_table);
+                stmt->table_name = left_table;  // 兼容保留
+
+                // 跳过 "JOIN " 关键字，提取右表名和可选的 ON 条件
+                std::string after_join = Trim(table_part.substr(join_pos + 6));
+                std::string upper_after_join = ToUpper(after_join);
+                size_t on_pos = upper_after_join.find(" ON ");
+                size_t right_end = (on_pos != std::string::npos) ? on_pos : std::string::npos;
+
+                std::string right_table = Trim(after_join.substr(0, right_end));
+                stmt->table_names.push_back(right_table);
+
+                // 解析 ON 条件
+                if (on_pos != std::string::npos) {
+                    std::string on_cond = Trim(after_join.substr(on_pos + 4));
+                    stmt->join_condition = ParseCondition(on_cond);
+                }
+            } else {
+                // 隐式 JOIN：CROSS JOIN + WHERE 过滤（逗号分隔多表名）
+                size_t start = 0;
+                while (start < table_part.size()) {
+                    size_t comma = table_part.find(',', start);
+                    std::string tbl = Trim(table_part.substr(start, comma - start));
+                    if (!tbl.empty()) {
+                        stmt->table_names.push_back(tbl);
+                    }
+                    if (comma == std::string::npos) break;
+                    start = comma + 1;
+                }
+                if (!stmt->table_names.empty()) {
+                    stmt->table_name = stmt->table_names[0];  // 兼容保留
+                }
+            }
+        } else {
+            // === 单表路径（完全不变） ===
+            stmt->table_name = table_part;
+            stmt->table_names.push_back(stmt->table_name);  // 单表也填充列表，与 JOIN 路径保持一致
         }
 
         // 解析 WHERE 子句（在 GROUP BY / ORDER BY 之前截断）

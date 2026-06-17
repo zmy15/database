@@ -1,4 +1,4 @@
-#include "storage/file_disk_manager.h"
+﻿#include "storage/file_disk_manager.h"
 #include <iostream>
 #include <cstring>
 
@@ -26,7 +26,41 @@ FileDiskManager::FileDiskManager(const std::string& db_file) : file_name_(db_fil
 
     // 根据文件现有多大，推算当前应该从哪个 page_id 开始分配新页
     int file_size = GetFileSize(db_file);
-    next_page_id_ = file_size / PAGE_SIZE; 
+    next_page_id_ = file_size / PAGE_SIZE;
+
+    // 检测 Catalog 头部：读取文件前 8 字节检查 Magic + Version
+    char header[8] = {0};
+    if (file_size >= 8) {
+        db_io_.seekg(0, std::ios::beg);
+        db_io_.read(header, 8);
+        db_io_.clear();
+        uint32_t magic = *reinterpret_cast<uint32_t*>(header);
+        uint32_t version = *reinterpret_cast<uint32_t*>(header + 4);
+        if (magic == DB_CATALOG_MAGIC && version >= 1) {
+            has_catalog_header_ = true;
+            // 确保 page_id=0 不会被分配为数据页
+            if (next_page_id_ < 1) next_page_id_ = 1;
+            std::cout << "[Catalog] Found catalog header (version " << version
+                      << "), next_page_id=" << next_page_id_ << std::endl;
+        }
+    }
+
+    // 全新文件：写入 Catalog 头部
+    if (file_size == 0) {
+        char empty_page[PAGE_SIZE] = {0};
+        uint32_t magic = DB_CATALOG_MAGIC;
+        uint32_t version = DB_CATALOG_VERSION;
+        std::memcpy(empty_page, &magic, 4);
+        std::memcpy(empty_page + 4, &version, 4);
+        // 直接写入文件偏移 0
+        db_io_.clear();
+        db_io_.seekp(0, std::ios::beg);
+        db_io_.write(empty_page, PAGE_SIZE);
+        db_io_.flush();
+        has_catalog_header_ = true;
+        next_page_id_ = 1;  // page_id=0 留给 Catalog
+        std::cout << "[Catalog] New database, catalog initialized at page 0." << std::endl;
+    }
 }
 
 FileDiskManager::~FileDiskManager() {
@@ -75,6 +109,10 @@ void FileDiskManager::WritePage(page_id_t page_id, const char* page_data) {
 }
 
 page_id_t FileDiskManager::AllocatePage() {
+    // 如果文件包含 Catalog 头部，确保永远不分配 page_id=0
+    if (has_catalog_header_ && next_page_id_ < 1) {
+        next_page_id_ = 1;
+    }
     // 加1再返回当前没加之前的值，保证线程安全分配
     page_id_t new_page_id = next_page_id_++; 
 
@@ -97,6 +135,33 @@ int FileDiskManager::GetFileSize(const std::string& file_name) {
     if (!in.is_open()) return 0;
     auto size = in.tellg();
     return static_cast<int>(size);
+}
+
+void FileDiskManager::ReadCatalogPage(char* page_data) {
+    std::lock_guard<std::mutex> lock(db_io_latch_);
+
+    // 获取文件当前大小
+    db_io_.seekg(0, std::ios::end);
+    int current_size = db_io_.tellg();
+    if (current_size < PAGE_SIZE) {
+        std::memset(page_data, 0, PAGE_SIZE);
+        return;
+    }
+
+    db_io_.seekg(0, std::ios::beg);
+    db_io_.read(page_data, PAGE_SIZE);
+    if (db_io_.bad() || db_io_.fail()) {
+        db_io_.clear();
+    }
+}
+
+void FileDiskManager::WriteCatalogPage(const char* page_data) {
+    std::lock_guard<std::mutex> lock(db_io_latch_);
+
+    db_io_.clear();
+    db_io_.seekp(0, std::ios::beg);
+    db_io_.write(page_data, PAGE_SIZE);
+    db_io_.flush();
 }
 
 } // namespace db

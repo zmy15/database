@@ -1,4 +1,4 @@
-﻿# 🗄️ Micro Database Engine — A Miniature Relational Database Engine
+# 🗄️ Micro Database Engine — A Miniature Relational Database Engine
 
 [![Language](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://en.cppreference.com/w/cpp/20)
 [![License](https://img.shields.io/badge/License-GPL--3.0-green.svg)](LICENSE.txt)
@@ -335,4 +335,4 @@ ABORT;  -- rollback
 - [ ] Query optimizer (cost estimation based on statistics)
 - [ ] Network protocol layer (MySQL / PostgreSQL compatible)
 - [ ] MVCC (Multi-Version Concurrency Control)
-- [ ] Persistent catalog system
+- [x] Persistent catalog system

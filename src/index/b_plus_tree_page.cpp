@@ -370,6 +370,65 @@ bool BPlusTreePage::IsSlotVisible(uint32_t slot_idx, txn_id_t reader_txn,
 }
 
 // ============================================================
+// 物理槽位回收
+// ============================================================
+
+bool BPlusTreePage::RemoveSlot(uint32_t slot_idx) {
+    uint32_t slot_count = GetSlotCount();
+    if (slot_idx >= slot_count) {
+        return false;
+    }
+
+    // 1. 将后续槽位整体前移一个位置（压缩槽位数组）
+    for (uint32_t i = slot_idx + 1; i < slot_count; ++i) {
+        uint32_t off = GetSlotOffset(i);
+        uint32_t sz = GetSlotSize(i);
+        SetSlotOffset(i - 1, off);
+        SetSlotSize(i - 1, sz);
+    }
+
+    // 2. 清除最后一个槽位（防止残留数据干扰后续查找）
+    SetSlotOffset(slot_count - 1, 0);
+    SetSlotSize(slot_count - 1, 0);
+
+    // 3. 更新槽位计数
+    SetSlotCount(slot_count - 1);
+
+    // 4. 重新计算空闲指针：遍历所有保留槽位，找到最小偏移量
+    //    被移除槽位的数据区会被后续插入自然覆盖（空闲指针从 PAGE_SIZE 向低地址增长）
+    if (slot_count - 1 > 0) {
+        uint32_t min_offset = GetSlotOffset(0);
+        for (uint32_t i = 1; i < slot_count - 1; ++i) {
+            uint32_t off = GetSlotOffset(i);
+            if (off < min_offset) min_offset = off;
+        }
+        SetFreeSpacePointer(min_offset);
+    } else {
+        SetFreeSpacePointer(PAGE_SIZE);
+    }
+
+    return true;
+}
+
+uint32_t BPlusTreePage::GetActiveSlotCount() {
+    uint32_t count = GetSlotCount();
+    uint32_t active = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (!IsSlotDeleted(i)) {
+            ++active;
+        }
+    }
+    return active;
+}
+
+bool BPlusTreePage::IsUnderfull() {
+    // 理论最大槽位数（仅按槽位数组大小估算，实际容量受 key/value 大小限制）
+    // 保守使用 1/4 阈值，避免频繁触发合并/重分配
+    uint32_t max_slots = (PAGE_SIZE - SIZE_PAGE_HEADER) / SIZE_SLOT;
+    return GetActiveSlotCount() < max_slots / 4;
+}
+
+// ============================================================
 // 二分查找
 // ============================================================
 

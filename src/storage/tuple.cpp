@@ -1,9 +1,11 @@
-﻿#include "storage/tuple.h"
+#include "storage/tuple.h"
 #include "concurrency/lock_manager.h"
 #include "concurrency/transaction.h"
 #include <cstring>
 
 namespace db {
+
+// JOIN 支持：Tuple::Merge 已从 private 移至 public（tuple.h），强制重新编译本文件
 
 Tuple::Tuple(std::vector<std::string> values) : values_(std::move(values)) {
     // 计算序列化后的大小：
