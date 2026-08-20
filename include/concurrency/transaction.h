@@ -3,6 +3,7 @@
 #include "common/config.h"
 #include <string>
 #include <unordered_set>
+#include <utility>
 
 namespace db {
 
@@ -44,6 +45,24 @@ public:
         exclusive_lock_set_.erase(lock_key);
     }
 
+    // ========== REPEATABLE_READ 快照支持 ==========
+    // 快照：事务 BEGIN 时刻已提交/已中止的事务集合（仅 REPEATABLE_READ 级别捕获）
+    const std::unordered_set<txn_id_t>& GetSnapshotCommitted() const { return snapshot_committed_; }
+    const std::unordered_set<txn_id_t>& GetSnapshotAborted() const { return snapshot_aborted_; }
+    // 是否启用了快照（仅 REPEATABLE_READ 级别为 true）
+    bool HasSnapshot() const { return has_snapshot_; }
+    // 捕获快照（由 TransactionManager::Begin 在 REPEATABLE_READ 级别下调用）
+    void SetSnapshot(std::unordered_set<txn_id_t> committed,
+                     std::unordered_set<txn_id_t> aborted) {
+        snapshot_committed_ = std::move(committed);
+        snapshot_aborted_ = std::move(aborted);
+        has_snapshot_ = true;
+    }
+
+    // REPEATABLE_READ 快照：事务开始时已提交/已中止的事务集合
+    std::unordered_set<txn_id_t> snapshot_committed_;
+    std::unordered_set<txn_id_t> snapshot_aborted_;
+    bool has_snapshot_ = false;
 private:
     txn_id_t txn_id_;
     IsolationLevel isolation_level_;

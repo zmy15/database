@@ -92,6 +92,12 @@ public:
     bool IsCommitted(txn_id_t txn_id) const;
     bool IsAborted(txn_id_t txn_id) const;
 
+    // REPEATABLE_READ 快照感知的可见性查询：
+    // 若 reader_txn 是 REPEATABLE_READ 且已捕获 BEGIN 时刻快照，则基于快照判断；
+    // 否则回退到实时全局状态（等价于 IsCommitted / IsAborted）
+    bool IsCommittedFor(txn_id_t txn_id, txn_id_t reader_txn) const;
+    bool IsAbortedFor(txn_id_t txn_id, txn_id_t reader_txn) const;
+
     // 崩溃恢复时注册已提交/已中止事务（供 MVCC 可见性判断）
     void MarkCommitted(txn_id_t txn_id) { committed_txns_.insert(txn_id); }
     void MarkAborted(txn_id_t txn_id) { aborted_txns_.insert(txn_id); }

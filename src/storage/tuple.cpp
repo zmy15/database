@@ -101,8 +101,9 @@ Tuple Tuple::Merge(const Tuple& left, const Tuple& right) {
 
 bool Tuple::IsVisible(const Tuple& tuple, txn_id_t reader_txn,
                       TransactionManager* txn_mgr, IsolationLevel iso_level) {
-    (void)iso_level; // 当前 READ_COMMITTED/REPEATABLE_READ/SERIALIZABLE 共用相同逻辑
-                     // TODO: REPEATABLE_READ 需基于快照 LSN 做更严格的可见性过滤
+    // REPEATABLE_READ：基于读者事务 BEGIN 时刻捕获的快照判断可见性，
+    // 实现真正的可重复读语义；READ_COMMITTED / SERIALIZABLE 保持实时全局状态判断。
+    const bool use_snapshot = (iso_level == IsolationLevel::REPEATABLE_READ);
 
     txn_id_t xmin = tuple.GetXmin();
     txn_id_t xmax = tuple.GetXmax();
@@ -118,15 +119,26 @@ bool Tuple::IsVisible(const Tuple& tuple, txn_id_t reader_txn,
         if (xmax == 0 || xmax == reader_txn) {
             return true;  // 未删除 或 被自己删除
         }
-        if (txn_mgr && txn_mgr->IsAborted(xmax)) {
-            return true;  // 删除者已回滚
+        // REPEATABLE_READ 用读者快照判断删除者状态，其余级别用实时状态
+        bool deleter_aborted = use_snapshot
+            ? (txn_mgr && txn_mgr->IsAbortedFor(xmax, reader_txn))
+            : (txn_mgr && txn_mgr->IsAborted(xmax));
+        if (deleter_aborted) {
+            return true;  // 删除者已回滚 → 删除无效
         }
         return false;     // xmax 已提交 → 已被他人删除
     }
 
     // 规则 3：创建者未提交 → 不可见
-    if (!txn_mgr || !txn_mgr->IsCommitted(xmin)) {
+    if (!txn_mgr) {
         return false;
+    }
+    // REPEATABLE_READ：创建者必须在读者快照的已提交集合中；其余级别：实时提交状态
+    bool creator_committed = use_snapshot
+        ? txn_mgr->IsCommittedFor(xmin, reader_txn)
+        : txn_mgr->IsCommitted(xmin);
+    if (!creator_committed) {
+        return false;  // 创建者未提交 → 不可见
     }
 
     // 规则 4：检查删除标记 xmax
@@ -136,7 +148,11 @@ bool Tuple::IsVisible(const Tuple& tuple, txn_id_t reader_txn,
     if (xmax == reader_txn) {
         return true;  // 被自己删除（UNDO 需要仍可看到）
     }
-    if (txn_mgr->IsAborted(xmax)) {
+    // REPEATABLE_READ 用读者快照判断删除者状态，其余级别用实时状态
+    bool deleter_aborted = use_snapshot
+        ? txn_mgr->IsAbortedFor(xmax, reader_txn)
+        : txn_mgr->IsAborted(xmax);
+    if (deleter_aborted) {
         return true;  // 删除者已回滚 → 删除无效
     }
 

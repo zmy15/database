@@ -72,7 +72,7 @@
 | **FileDiskManager** | `src/storage/file_disk_manager.cpp` | 基于本地文件的磁盘实现 |
 | **TablePage** | `include/storage/table_page.h` | 槽式页面布局（slotted page），支持 Insert / MarkDelete / Update / 遍历 |
 | **TableHeap** | `include/storage/table_heap.h` | 表堆 = 双向链表串联多个 TablePage，提供迭代器 |
-| **Tuple** | `include/storage/tuple.h` | 元组序列化/反序列化，支持变长字符串字段 |
+| **Tuple** | `include/storage/tuple.h` | 元组序列化/反序列化，支持变长字符串字段；携带 MVCC 版本字段（xmin/xmax）及 `IsVisible` 可见性判断 |
 
 - 页面大小：**4KB** (`PAGE_SIZE = 4096`)
 - 表堆使用双向链表串联多个页面，支持高效追加写入
@@ -108,11 +108,13 @@ AbstractExecutor (基类)
   ├── FilterExecutor       WHERE 条件过滤（包装子执行器）
   ├── ProjectionExecutor   SELECT 列投影 + ORDER BY 排序
   ├── AggregationExecutor  聚合计算 (COUNT/SUM/AVG/MIN/MAX) + GROUP BY
-  └── IndexScanExecutor    B+ 树索引扫描（点查 + 范围扫描）
+  ├── IndexScanExecutor    B+ 树索引扫描（点查 + 范围扫描）
+  └── NestedLoopJoinExecutor 嵌套循环连接（INNER JOIN / CROSS JOIN）
 ```
 
 - **Planner** 根据 WHERE 条件中的列是否命中索引自动选择 IndexScan 或 SeqScan+Filter
 - 火山模型：每个执行器实现 `Init()` + `Next(Tuple*)` 接口，按需拉取数据
+- **JOIN 支持**：`NestedLoopJoinExecutor` 实现 INNER JOIN 与 CROSS JOIN，通过 `Tuple::Merge()` 拼接左右表列
 
 ### 6. 事务与并发控制
 
@@ -330,8 +332,8 @@ ABORT;  -- 回滚
 
 - [x] 完整的 DROP TABLE 实现
 - [ ] 多列索引与复合索引
-- [ ] JOIN 操作符（Nested Loop / Hash Join）
+- [x] JOIN 操作符（Nested Loop / Hash Join）
 - [ ] 查询优化器（基于统计信息的代价估算）
 - [ ] 网络协议层（MySQL / PostgreSQL 兼容协议）
-- [ ] MVCC（多版本并发控制）
+- [x] MVCC（多版本并发控制）
 - [x] 真正的持久化 Catalog 系统

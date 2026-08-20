@@ -73,7 +73,7 @@ A fully functional, lightweight relational database engine built **from scratch 
 | **FileDiskManager** | `src/storage/file_disk_manager.cpp` | File-based disk implementation |
 | **TablePage** | `include/storage/table_page.h` | Slotted page layout with Insert / MarkDelete / Update / iteration |
 | **TableHeap** | `include/storage/table_heap.h` | Doubly-linked list of TablePages with iterator support |
-| **Tuple** | `include/storage/tuple.h` | Tuple serialization/deserialization with variable-length string fields |
+| **Tuple** | `include/storage/tuple.h` | Tuple serialization/deserialization with variable-length string fields; carries MVCC version fields (xmin/xmax) and `IsVisible` visibility checks |
 
 - Page size: **4KB** (`PAGE_SIZE = 4096`)
 - TableHeap uses a doubly-linked page chain for efficient append
@@ -109,11 +109,13 @@ AbstractExecutor (base class)
   ├── FilterExecutor       WHERE clause filtering (wraps a child executor)
   ├── ProjectionExecutor   Column projection + ORDER BY sorting
   ├── AggregationExecutor  Aggregate computation (COUNT/SUM/AVG/MIN/MAX) + GROUP BY
-  └── IndexScanExecutor    B+ tree index scan (point + range query)
+  ├── IndexScanExecutor    B+ tree index scan (point + range query)
+  └── NestedLoopJoinExecutor  Nested-loop join (INNER JOIN / CROSS JOIN)
 ```
 
 - **Planner** selects IndexScan or SeqScan+Filter based on index availability
 - Volcano model: each executor implements `Init()` + `Next(Tuple*)`, pulling data on demand
+- **JOIN support**: `NestedLoopJoinExecutor` implements INNER JOIN and CROSS JOIN, merging left/right columns via `Tuple::Merge()`
 
 ### 6. Transactions & Concurrency Control
 
@@ -331,8 +333,8 @@ ABORT;  -- rollback
 
 - [x] Complete DROP TABLE implementation
 - [ ] Multi-column and composite indexes
-- [ ] JOIN operators (Nested Loop / Hash Join)
+- [x] JOIN operators (Nested Loop / Hash Join)
 - [ ] Query optimizer (cost estimation based on statistics)
 - [ ] Network protocol layer (MySQL / PostgreSQL compatible)
-- [ ] MVCC (Multi-Version Concurrency Control)
+- [x] MVCC (Multi-Version Concurrency Control)
 - [x] Persistent catalog system

@@ -345,6 +345,12 @@ Transaction* TransactionManager::Begin(IsolationLevel iso_level) {
         raw->SetBeginLSN(lsn);
     }
 
+    // REPEATABLE_READ：捕获当前已提交/已中止事务集合作为快照，
+    // 此后整个事务的可见性判断基于此快照，而非实时全局状态
+    if (iso_level == IsolationLevel::REPEATABLE_READ) {
+        raw->SetSnapshot(committed_txns_, aborted_txns_);
+    }
+
     return raw;
 }
 
@@ -408,6 +414,26 @@ bool TransactionManager::IsAborted(txn_id_t txn_id) const {
         return true;
     }
     return false;
+}
+
+bool TransactionManager::IsCommittedFor(txn_id_t txn_id, txn_id_t reader_txn) const {
+    // REPEATABLE_READ 读者：基于其 BEGIN 时刻捕获的快照判断
+    auto it = txn_map_.find(reader_txn);
+    if (it != txn_map_.end() && it->second->HasSnapshot()) {
+        return it->second->GetSnapshotCommitted().count(txn_id) > 0;
+    }
+    // 其他隔离级别 / 防御性回退：实时全局状态
+    return IsCommitted(txn_id);
+}
+
+bool TransactionManager::IsAbortedFor(txn_id_t txn_id, txn_id_t reader_txn) const {
+    // REPEATABLE_READ 读者：基于其 BEGIN 时刻捕获的快照判断
+    auto it = txn_map_.find(reader_txn);
+    if (it != txn_map_.end() && it->second->HasSnapshot()) {
+        return it->second->GetSnapshotAborted().count(txn_id) > 0;
+    }
+    // 其他隔离级别 / 防御性回退：实时全局状态
+    return IsAborted(txn_id);
 }
 
 void TransactionManager::Abort(Transaction* txn) {

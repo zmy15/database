@@ -119,3 +119,37 @@ target_link_libraries(table_heap_test PRIVATE gtest_main)
 
 gtest_discover_tests(table_page_test)
 gtest_discover_tests(table_heap_test)
+
+# MVCC 可见性专项测试
+add_executable(mvcc_test
+    "test/concurrency/mvcc_visibility_test.cpp"
+    "src/concurrency/lock_manager.cpp"
+    "src/concurrency/transaction.cpp"
+    "src/storage/tuple.cpp"
+    "src/storage/table_page.cpp"
+    "src/storage/table_heap.cpp"
+    "src/storage/file_disk_manager.cpp"
+    "src/buffer/lru_replacer.cpp"
+    "src/buffer/buffer_pool_manager.cpp"
+)
+target_include_directories(mvcc_test PRIVATE include)
+target_link_libraries(mvcc_test PRIVATE gtest_main)
+
+# JOIN 执行器专项测试
+add_executable(join_test
+    "test/execution/join_executor_test.cpp"
+    "src/execution/nested_loop_join_executor.cpp"
+    "src/storage/tuple.cpp"
+    "src/storage/table_page.cpp"
+    "src/storage/table_heap.cpp"
+    "src/storage/file_disk_manager.cpp"
+    "src/buffer/lru_replacer.cpp"
+    "src/buffer/buffer_pool_manager.cpp"
+    "src/concurrency/lock_manager.cpp"
+    "src/concurrency/transaction.cpp"
+)
+target_include_directories(join_test PRIVATE include)
+target_link_libraries(join_test PRIVATE gtest_main)
+
+gtest_discover_tests(mvcc_test)
+gtest_discover_tests(join_test)
